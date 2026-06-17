@@ -17,6 +17,12 @@ local function find_project_root(dir, marker)
         if vim.fn.filereadable(current .. "/" .. marker) == 1 then
             return current
         end
+
+        -- Stop at a git repo boundary
+        if vim.fn.isdirectory(current .. "/.git") == 1 then
+            return nil
+        end
+
         local parent = vim.fn.fnamemodify(current, ":h")
         if parent == current then
             break
@@ -30,6 +36,16 @@ local function cpp_command(abs_file)
     local dir = vim.fn.fnamemodify(abs_file, ":h")
 
     local make_root = find_project_root(dir, "Makefile")
+    if make_root and make_root ~= dir then
+        local choice = vim.fn.confirm(
+            "Found Makefile at " .. make_root .. " (not current dir). Build with it?",
+            "&No, compile single file\n&Yes",
+            1
+        )
+        if choice ~= 2 then
+            make_root = nil
+        end
+    end
     if make_root then
         local root_q = vim.fn.shellescape(make_root)
         vim.fn.system("grep -qE '^run[[:space:]]*:' " .. vim.fn.shellescape(make_root .. "/Makefile"))
@@ -38,6 +54,16 @@ local function cpp_command(abs_file)
     end
 
     local cmake_root = find_project_root(dir, "CMakeLists.txt")
+    if cmake_root and cmake_root ~= dir then
+        local choice = vim.fn.confirm(
+            "Found CMakeLists.txt at " .. cmake_root .. " (not current dir). Build with it?",
+            "&No, compile single file\n&Yes",
+            1
+        )
+        if choice ~= 2 then
+            cmake_root = nil
+        end
+    end
     if cmake_root then
         local root_q = vim.fn.shellescape(cmake_root)
         local exe = vim.fn.trim(
