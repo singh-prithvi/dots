@@ -1,0 +1,6 @@
+require("config.keymaps.insert")
+require("config.keymaps.tabs")
+require("config.keymaps.buffers")
+require("config.keymaps.terminal")
+require("config.keymaps.runner")
+require("config.keymaps.misc")
