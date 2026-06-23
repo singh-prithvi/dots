@@ -26,7 +26,7 @@ hl.bind(
 	hl.dsp.global("quickshell:workspaceNumber"),
 	{ ignore_mods = true, transparent = true, release = true }
 )
-hl.bind("SUPER + Tab", hl.dsp.global("quickshell:overviewWorkspacesToggle"), { description = "Shell: Toggle overview" })
+-- hl.bind("SUPER + Tab", hl.dsp.global("quickshell:overviewWorkspacesToggle"), { description = "Shell: Toggle overview" })
 hl.bind("SUPER + V", hl.dsp.global("quickshell:overviewClipboardToggle"))
 hl.bind("SUPER + Period", hl.dsp.global("quickshell:overviewEmojiToggle"))
 hl.bind("SUPER + A", hl.dsp.global("quickshell:sidebarLeftToggle"), { description = "Shell: Toggle left sidebar" })
@@ -371,6 +371,10 @@ for i = 1, 10 do
 		hl.dispatch(hl.dsp.focus({ workspace = workspace_in_group(i) }))
 	end)
 end
+-- Next/Previous workspace
+hl.bind("SUPER + Tab", hl.dsp.focus({ workspace = "r+1" }), { description = "Workspace: Next" })
+
+hl.bind("SUPER + SHIFT + Tab", hl.dsp.focus({ workspace = "r-1" }), { description = "Workspace: Previous" })
 
 --#/# bind = CTRL+SUPER, ←/→,, -- Focus left/right
 --#/# bind = CTRL+SUPER+ALT, ←/→,, -- # [hidden] Focus busy left/right

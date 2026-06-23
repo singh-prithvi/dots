@@ -1,4 +1,5 @@
 config.load_autoconfig()
+c.content.javascript.can_open_tabs_automatically = True
 
 # Remove default tab switching bindings
 config.unbind('J')
