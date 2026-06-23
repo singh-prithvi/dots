@@ -26,3 +26,9 @@ vim.api.nvim_create_autocmd("ColorScheme", {
 })
 
 vim.opt.timeoutlen = 200 -- Time (ms) to wait for mapped key sequences (jk → Esc)
+
+vim.schedule(function()
+    vim.api.nvim_set_hl(0, "Normal", { bg = "NONE" })
+    vim.api.nvim_set_hl(0, "NormalNC", { bg = "NONE" })
+    vim.api.nvim_set_hl(0, "EndOfBuffer", { bg = "NONE" })
+end)
