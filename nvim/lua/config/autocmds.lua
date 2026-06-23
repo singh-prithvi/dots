@@ -1,15 +1,16 @@
--- Autocmds are automatically loaded on the VeryLazy event
--- Default autocmds that are always set: https://github.com/LazyVim/LazyVim/blob/main/lua/lazyvim/config/autocmds.lua
--- Add any additional autocmds here
+-- lua/config/autocmds.lua
+-- Loaded automatically by LazyVim on the VeryLazy event (after plugins and
+-- colorscheme are already set up).
+-- LazyVim defaults: https://github.com/LazyVim/LazyVim/blob/main/lua/lazyvim/config/autocmds.lua
 
--- Group prevents duplicate autocmds if this file is ever re-sourced
+-- ─── Relative-number toggle on insert ─────────────────────────────────────
+-- Switch to absolute line numbers while typing, back to relative on leave.
 local number_group = vim.api.nvim_create_augroup("user_number_toggle", { clear = true })
 
 vim.api.nvim_create_autocmd("InsertEnter", {
     group = number_group,
     callback = function()
         vim.wo.relativenumber = false
-        vim.wo.number = true
     end,
 })
 
@@ -17,16 +18,13 @@ vim.api.nvim_create_autocmd("InsertLeave", {
     group = number_group,
     callback = function()
         vim.wo.relativenumber = true
-        vim.wo.number = true
     end,
 })
 
--- Per-filetype indentation overrides
--- C/C++ explicitly set to 8-space tabs to match Linux kernel style.
--- This FileType autocmd is intentional even though the global default in
--- options.lua is already 8 — it guards against future global changes and
--- ensures these filetypes always get this specific width regardless.
+-- ─── Per-filetype indentation overrides ───────────────────────────────────
+-- Pin C/C++ to 8-space indentation regardless of future global changes.
 vim.api.nvim_create_autocmd("FileType", {
+    group = vim.api.nvim_create_augroup("user_indent", { clear = true }),
     pattern = { "c", "cpp" },
     callback = function()
         vim.opt_local.shiftwidth = 8
@@ -34,3 +32,30 @@ vim.api.nvim_create_autocmd("FileType", {
         vim.opt_local.softtabstop = 8
     end,
 })
+
+-- ─── Theme overrides: transparency + Catppuccin Mocha cursor colour ───────
+-- WHY BOTH autocmd AND direct call?
+--   This file loads on VeryLazy, which is after the initial :colorscheme has
+--   already fired. The direct call below patches the currently-loaded theme.
+--   The ColorScheme autocmd re-applies them after any future :colorscheme
+--   change (e.g. switching themes at runtime).
+--
+-- WHY NOT rely on catppuccin's transparent_background = true?
+--   catppuccin handles its own groups, but Normal/NormalNC/EndOfBuffer
+--   occasionally revert in terminals that manage background separately.
+--   These three lines are a reliable belt-and-suspenders fallback.
+local function apply_theme_overrides()
+    -- Transparent background
+    vim.api.nvim_set_hl(0, "Normal", { bg = "NONE" })
+    vim.api.nvim_set_hl(0, "NormalNC", { bg = "NONE" })
+    vim.api.nvim_set_hl(0, "EndOfBuffer", { bg = "NONE" })
+    -- Catppuccin Mocha cursor: blue on dark base
+    vim.api.nvim_set_hl(0, "Cursor", { fg = "#1e1e2e", bg = "#89b4fa" })
+end
+
+vim.api.nvim_create_autocmd("ColorScheme", {
+    group = vim.api.nvim_create_augroup("user_theme_overrides", { clear = true }),
+    callback = apply_theme_overrides,
+})
+
+apply_theme_overrides() -- patch the already-loaded colorscheme right now

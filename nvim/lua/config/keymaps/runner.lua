@@ -1,9 +1,11 @@
-vim.api.nvim_create_autocmd("VimEnter", {
-    callback = function()
-        vim.g.cpp_term_buf = nil
-        vim.g.cpp_term_win = nil
-    end,
-})
+-- lua/config/keymaps/runner.lua
+-- F5 multi-language runner: C++, Python, Rust.
+-- Shares all C++ build-resolution logic with debugging.lua via config.utils.
+local utils = require("config.utils")
+
+-- ─── Terminal management ───────────────────────────────────────────────────
+-- vim.g.cpp_term_buf / vim.g.cpp_term_win track the persistent split terminal.
+-- No explicit VimEnter initialisation needed — globals default to nil.
 
 local function create_term()
     vim.cmd("botright split | resize 12 | terminal")
@@ -11,108 +13,57 @@ local function create_term()
     vim.g.cpp_term_win = vim.api.nvim_get_current_win()
 end
 
-local function find_project_root(dir, marker)
-    local current = dir
-    while true do
-        if vim.fn.filereadable(current .. "/" .. marker) == 1 then
-            return current
-        end
-
-        -- Stop at a git repo boundary
-        if vim.fn.isdirectory(current .. "/.git") == 1 then
-            return nil
-        end
-
-        local parent = vim.fn.fnamemodify(current, ":h")
-        if parent == current then
-            break
-        end
-        current = parent
-    end
-    return nil
-end
+-- ─── C++ build-command builder ────────────────────────────────────────────
+-- Tier logic (Makefile → CMake → single-file) lives in config.utils and is
+-- shared with debugging.lua. This function only decides what *shell command*
+-- to send to the terminal for each tier.
 
 local function cpp_command(abs_file)
     local dir = vim.fn.fnamemodify(abs_file, ":h")
 
-    local make_root = find_project_root(dir, "Makefile")
-    if make_root and make_root ~= dir then
-        local choice = vim.fn.confirm(
-            "Found Makefile at " .. make_root .. " (not current dir). Build with it?",
-            "&No, compile single file\n&Yes",
-            1
-        )
-        if choice ~= 2 then
-            make_root = nil
-        end
-    end
+    -- Tier 1: Makefile
+    local make_root = utils.find_build_root(dir, "Makefile")
     if make_root then
         local root_q = vim.fn.shellescape(make_root)
-        vim.fn.system("grep -qE '^run[[:space:]]*:' " .. vim.fn.shellescape(make_root .. "/Makefile"))
-        local suffix = vim.v.shell_error == 0 and " && make run" or ""
+        local suffix = utils.makefile_has_run_target(make_root) and " && make run" or ""
         return "cd " .. root_q .. " && make" .. suffix
     end
 
-    local cmake_root = find_project_root(dir, "CMakeLists.txt")
-    if cmake_root and cmake_root ~= dir then
-        local choice = vim.fn.confirm(
-            "Found CMakeLists.txt at " .. cmake_root .. " (not current dir). Build with it?",
-            "&No, compile single file\n&Yes",
-            1
-        )
-        if choice ~= 2 then
-            cmake_root = nil
-        end
-    end
+    -- Tier 2: CMakeLists.txt
+    local cmake_root = utils.find_build_root(dir, "CMakeLists.txt")
     if cmake_root then
         local root_q = vim.fn.shellescape(cmake_root)
-        local exe = vim.fn.trim(
-            vim.fn.system(
-                "awk '/add_executable/{gsub(/[()]/,\" \"); print $2; exit}' "
-                    .. vim.fn.shellescape(cmake_root .. "/CMakeLists.txt")
-            )
-        )
         local build_cmd = "cd "
             .. root_q
             .. " && cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -Wno-dev"
             .. " && cmake --build build"
-        -- exe is unusable when it's a CMake variable like ${PROJECT_NAME}
-        if exe ~= "" and not exe:match("^%$") then
+        local exe = utils.cmake_executable(cmake_root)
+        if exe then
             return build_cmd .. " && " .. vim.fn.shellescape(cmake_root .. "/build/" .. exe)
         end
         return build_cmd
     end
 
-    local stem = vim.fn.fnamemodify(abs_file, ":t:r")
-    -- Hash the directory so two projects with the same filename (e.g. main.cpp)
-    -- never share the same binary in ~/temp/.
-    local dir_hash = vim.fn.sha256(dir):sub(1, 6)
-    local out = vim.fn.expand("~/temp/") .. stem .. "_" .. dir_hash
-    vim.fn.mkdir(vim.fn.expand("~/temp"), "p")
-
-    local sources = { vim.fn.shellescape(abs_file) }
-    for _, sibling in ipairs(vim.fn.glob(dir .. "/*.cpp", false, true)) do
-        if sibling ~= abs_file then
-            -- Exclude files that define their own entry point to avoid duplicate-main
-            -- linker errors. Covers: int main, int  main, auto main -> int (C++20).
-            vim.fn.system("grep -qlE 'int[[:space:]]+main|auto[[:space:]]+main' " .. vim.fn.shellescape(sibling))
-            if vim.v.shell_error ~= 0 then
-                table.insert(sources, vim.fn.shellescape(sibling))
-            end
-        end
+    -- Tier 3: single-file (+ companion sources that don't have their own main)
+    local sources, out = utils.cpp_single_file_sources(abs_file)
+    local escaped = {}
+    for _, src in ipairs(sources) do
+        table.insert(escaped, vim.fn.shellescape(src))
     end
 
     return "g++ -std=c++20 -g -Wall -Wextra "
-        .. table.concat(sources, " ")
+        .. table.concat(escaped, " ")
         .. " -o "
         .. vim.fn.shellescape(out)
         .. " && "
         .. vim.fn.shellescape(out)
 end
 
+-- ─── Channel dispatcher ────────────────────────────────────────────────────
+
 local function run_file_in_chan(chan, abs_file, ft)
+    -- Clear terminal and print what we're running
     vim.fn.chansend(chan, "clear && printf '\\033[3J'\n")
-    -- printf %s is safe for any path; echo 'Running: ' .. path breaks on paths with single quotes.
     vim.fn.chansend(chan, "printf 'Running: %s\\n' " .. vim.fn.shellescape(abs_file) .. "\n")
 
     local dir = vim.fn.fnamemodify(abs_file, ":h")
@@ -122,10 +73,11 @@ local function run_file_in_chan(chan, abs_file, ft)
     elseif ft == "python" then
         vim.fn.chansend(chan, "python3 " .. vim.fn.shellescape(abs_file) .. "\n")
     elseif ft == "rust" then
-        local cargo_root = find_project_root(dir, "Cargo.toml")
+        local cargo_root = utils.find_project_root(dir, "Cargo.toml")
         if cargo_root then
             vim.fn.chansend(chan, "cd " .. vim.fn.shellescape(cargo_root) .. " && cargo run\n")
         else
+            -- No Cargo project — compile the single file with rustc
             local stem = vim.fn.fnamemodify(abs_file, ":t:r")
             local dir_hash = vim.fn.sha256(dir):sub(1, 6)
             local out = vim.fn.expand("~/temp/") .. stem .. "_" .. dir_hash
@@ -144,31 +96,38 @@ local function run_file_in_chan(chan, abs_file, ft)
     end
 end
 
--- ─── Runner ─────────────────────────────────────────────────────────────────
+-- ─── F5: Run current file ──────────────────────────────────────────────────
 vim.keymap.set({ "n", "i", "t" }, "<F5>", function()
+    -- If called from terminal window, switch back to code first
     if vim.bo.buftype == "terminal" then
         vim.cmd("wincmd p")
     end
+
     local ft = vim.bo.filetype
     if ft ~= "cpp" and ft ~= "python" and ft ~= "rust" then
         return
     end
+
     vim.cmd("write")
     local abs_file = vim.fn.expand("%:p")
+
     local win = vim.g.cpp_term_win
     if not (win and vim.api.nvim_win_is_valid(win)) then
         create_term()
     else
         vim.api.nvim_set_current_win(win)
     end
+
     local chan = vim.b[vim.g.cpp_term_buf].terminal_job_id
     if chan then
+        -- Send Ctrl-C to interrupt any running process, then wait a tick
         vim.fn.chansend(chan, "\003")
         vim.defer_fn(function()
             local new_chan = vim.b[vim.g.cpp_term_buf].terminal_job_id
             if new_chan and vim.fn.jobwait({ new_chan }, 0)[1] == -1 then
                 run_file_in_chan(new_chan, abs_file, ft)
             else
+                -- Terminal died; recreate it
                 vim.cmd("bd! " .. vim.g.cpp_term_buf)
                 create_term()
                 local restart_chan = vim.b[vim.g.cpp_term_buf].terminal_job_id
@@ -178,6 +137,7 @@ vim.keymap.set({ "n", "i", "t" }, "<F5>", function()
             end
         end, 100)
     else
+        -- Terminal just opened; give it a moment to initialise
         vim.defer_fn(function()
             local new_chan = vim.b[vim.g.cpp_term_buf].terminal_job_id
             if new_chan then
@@ -185,5 +145,6 @@ vim.keymap.set({ "n", "i", "t" }, "<F5>", function()
             end
         end, 150)
     end
-    vim.cmd("wincmd p")
+
+    vim.cmd("wincmd p") -- return focus to source file
 end, { desc = "Run current file (C++ / Python / Rust)" })
