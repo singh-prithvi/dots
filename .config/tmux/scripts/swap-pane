@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+
+dir="${1:?direction required}"
+
+current="$(tmux display-message -p '#{pane_id}')"
+cl="$(tmux display-message -p '#{pane_left}')"
+ct="$(tmux display-message -p '#{pane_top}')"
+cr="$(tmux display-message -p '#{pane_right}')"
+cb="$(tmux display-message -p '#{pane_bottom}')"
+
+best=""
+best_dist=999999999
+
+while IFS=' ' read -r id left top right bottom; do
+        [[ "$id" == "$current" ]] && continue
+
+        case "$dir" in
+        left)
+                if ((right < cl)) && ((bottom >= ct)) && ((top <= cb)); then
+                        dist=$((cl - right))
+                else
+                        continue
+                fi
+                ;;
+        right)
+                if ((left > cr)) && ((bottom >= ct)) && ((top <= cb)); then
+                        dist=$((left - cr))
+                else
+                        continue
+                fi
+                ;;
+        up)
+                if ((bottom < ct)) && ((right >= cl)) && ((left <= cr)); then
+                        dist=$((ct - bottom))
+                else
+                        continue
+                fi
+                ;;
+        down)
+                if ((top > cb)) && ((right >= cl)) && ((left <= cr)); then
+                        dist=$((top - cb))
+                else
+                        continue
+                fi
+                ;;
+        *)
+                exit 1
+                ;;
+        esac
+
+        if ((dist < best_dist)); then
+                best="$id"
+                best_dist="$dist"
+        fi
+done < <(tmux list-panes -F "#{pane_id} #{pane_left} #{pane_top} #{pane_right} #{pane_bottom}")
+
+if [[ -n "$best" ]]; then
+        tmux swap-pane -d -s "$current" -t "$best"
+fi
