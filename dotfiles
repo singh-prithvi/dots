@@ -59,6 +59,9 @@ MENU_RESULT=""       # set by show_interactive_menu; read by its callers
 ORIGINAL_STTY=""     # saved terminal settings, for restore on exit — lose
                       # this and someone's shell stays invisible forever,
                       # which is a bold way to make an enemy
+WINDOW_RESIZED=0      # set by the WINCH trap, consumed by read_key — the
+                      # thing you forgot to even THINK about when you asked
+                      # for "flicker-free" and got "corrupted on resize" instead
 
 # Seed values for the tracked-paths config file. These are only ever used
 # once, the very first time the app runs and PATHS_CONFIG_FILE doesn't
@@ -261,17 +264,36 @@ term_width() {
 }
 
 # Print a horizontal rule spanning the terminal width.
+#
+# BUG YOU FOUND (the "dividers" in your screenshots): this used to end with
+# a bare `\n`. If the terminal had just gotten narrower, or the previous
+# line at this exact row was drawn at a wider width, the tail end of the
+# OLD rule kept sitting there past where the NEW, shorter rule stopped —
+# because nothing ever told the terminal "and erase whatever's left on
+# this line." `tput el` (erase-to-end-of-line) does exactly that, and it
+# has to run AFTER the rule is drawn but BEFORE the newline, while the
+# cursor is still sitting on this row and not the next one.
 # Usage: print_rule "─"
 print_rule() {
         local char="${1:--}"
         local width
         width=$(term_width)
-        printf '%*s\n' "$width" '' | tr ' ' "$char"
+        printf '%*s' "$width" '' | tr ' ' "$char"
+        tput el
+        printf '\n'
 }
 
 # Print text centered within the terminal width, in an optional color.
 # Centering text is the one thing in this entire project that's actually
 # balanced.
+#
+# BUG YOU FOUND ("GitMANAGER", "CommitER"): centered text starts at a
+# DIFFERENT column depending on how long it is — "DOTFILES MANAGER" starts
+# further left than "Git" does, because they're both centered around the
+# same midpoint but have different lengths. Without erasing this row
+# before moving on, whatever the LAST title left behind outside the new
+# title's footprint just... stays there, mashed up against the new one.
+# Same `tput el`-before-newline fix as print_rule, same reason.
 # Usage: print_centered "some text" "$C_BOLD$C_ACCENT"
 print_centered() {
         local text="$1"
@@ -280,7 +302,9 @@ print_centered() {
         width=$(term_width)
         padding=$(((width - ${#text}) / 2))
         ((padding < 0)) && padding=0
-        printf '%*s%s%s%s\n' "$padding" '' "$color" "$text" "$C_RESET"
+        printf '%*s%s%s%s' "$padding" '' "$color" "$text" "$C_RESET"
+        tput el
+        printf '\n'
 }
 
 # Replace a leading $HOME with ~, purely for display. Defined once so the
@@ -368,7 +392,7 @@ restore_terminal_mode() {
 }
 
 # Read exactly one logical keypress and classify it. Returns one of:
-#   UP DOWN LEFT RIGHT ENTER ESCAPE  or  KEY:<char> for anything else.
+#   UP DOWN LEFT RIGHT ENTER ESCAPE RESIZE  or  KEY:<char> for anything else.
 #
 # Arrow keys don't send a single byte — they send an escape sequence
 # (ESC, then '[', then a letter), a convention terminals have followed
@@ -376,9 +400,24 @@ restore_terminal_mode() {
 # against a second read: if two more bytes show up almost instantly,
 # it was an arrow key; if nothing follows, it was just a lonely Esc,
 # not unlike your commitment to any given hobby.
+#
+# RESIZE handling lives here too. When SIGWINCH fires mid-read (someone
+# dragged the terminal edge), bash interrupts this blocking `read` and
+# runs the trap, which just sets WINDOW_RESIZED=1 and gets out of the
+# way. We check that flag FIRST, before trying to interpret whatever
+# `read` handed back — because an interrupted read can leave `key` empty,
+# and an empty key is what ENTER looks like below. Skip this check and a
+# window resize starts silently firing menu selections for you. You do
+# not want that particular surprise.
 read_key() {
         local key seq
         IFS= read -rsn1 key || true
+
+        if ((WINDOW_RESIZED)); then
+                WINDOW_RESIZED=0
+                echo "RESIZE"
+                return 0
+        fi
 
         case "$key" in
         $'\x1b')
@@ -409,14 +448,68 @@ read_key() {
         return 0
 }
 
-# Read one line of free text (commit messages, paths, etc). Temporarily
-# hands the terminal back to normal cooked mode with the cursor visible,
-# since that's what a person typing a sentence actually wants — a
-# concept you apparently needed a whole function to arrive at.
+# Read one line of free text (commit messages, paths, etc).
+#
+# BUG YOU FOUND (image 3 — `^[j^[^[^[^[q` sitting in your commit message):
+# this used to hand the terminal back to cooked mode and call the `read`
+# builtin. Cooked mode has no idea what "Esc" means — it's not a control
+# character to bash's line editor, it's just a byte, so pressing Esc (and
+# then more keys, panicking) got typed into the message VERBATIM. Every
+# other screen in this app treats Esc as "go back." This one silently
+# didn't, and nothing on screen told you that.
+#
+# Fixed by building the line ourselves, one read_key() at a time, in the
+# SAME raw mode everything else already runs in — so this function now
+# understands the same three keys as every menu: Enter submits, Esc
+# cancels (returns empty — every caller already treats an empty result
+# as "cancelled", so nothing downstream needed to change), and Backspace
+# erases the last character both from the buffer and from the screen.
+# Because we no longer drop into cooked mode, callers must NOT wrap this
+# in restore_terminal_mode/enter_raw_mode anymore — that would just turn
+# the cursor's line editing back over to the terminal and reintroduce
+# the exact bug this fixes. Search for prompt_line's call sites; if one
+# of them still bookends it with restore/enter, you undid this.
 prompt_line() {
         local prompt="$1"
-        local input
-        read -r -p "  ${prompt}" input
+        local input="" key ch
+
+        printf '  %s' "$prompt"
+
+        while true; do
+                key=$(read_key)
+                case "$key" in
+                ENTER)
+                        break
+                        ;;
+                ESCAPE)
+                        input=""
+                        break
+                        ;;
+                RESIZE)
+                        # Not much we can salvage mid-typing on a resize —
+                        # clearing and reprinting is the honest option
+                        # rather than leaving a half-corrupted prompt.
+                        clear
+                        printf '  %s%s' "$prompt" "$input"
+                        ;;
+                'KEY:'$'\x7f' | 'KEY:'$'\x08')
+                        if [[ -n "$input" ]]; then
+                                input="${input%?}"
+                                printf '\b \b'
+                        fi
+                        ;;
+                KEY:*)
+                        ch="${key#KEY:}"
+                        input+="$ch"
+                        printf '%s' "$ch"
+                        ;;
+                *)
+                        : # arrows etc. mean nothing to a text field, ignore them
+                        ;;
+                esac
+        done
+
+        echo
         printf '%s' "$input"
 }
 
@@ -440,6 +533,13 @@ confirm() {
                         echo
                         return 1
                         ;;
+                RESIZE)
+                        # Best-effort: we can't redraw content we no longer
+                        # have, but re-showing the question beats leaving a
+                        # corrupted line up while you wait for an answer.
+                        clear
+                        printf '  %s%s%s %s %s[y/N]%s ' "$C_YELLOW" "$ICON_WARN" "$C_RESET" "$prompt" "$C_DIM" "$C_RESET"
+                        ;;
                 *) : ;; # anything else: keep waiting, don't guess — unlike you at 3am with rm -rf
                 esac
         done
@@ -449,19 +549,32 @@ confirm() {
 # user a moment to actually read the output of the action they just ran,
 # a courtesy you rarely extend to yourself in git commit messages.
 #
-# Since we stopped nuking the whole screen with `clear` on every redraw,
-# this is also the designated cleanup spot: by the time we get here, the
-# current action screen has finished printing everything it's going to
-# print, so it's the safest place to erase any stale leftover lines from
-# a taller previous frame (e.g. a long `git diff` sticking around under
-# a short "nothing to commit" message). `tput ed` erases from the cursor
-# to the bottom of the screen — cheap, and it never produces the blank-
-# frame flash a full `clear` would.
+# NOTE ON WHERE THE "ERASE STALE STUFF" JOB LIVES NOW: it used to live
+# here, running once the screen was already fully drawn — which is
+# exactly why a stale, taller previous screen (the full Git menu, in
+# your screenshots) was still visible the ENTIRE TIME an action screen
+# was busy prompting you for something, right up until you got here.
+# That job now happens once, up front, in begin_action_screen — before
+# a single line of the new screen's content gets drawn — instead of
+# being an afterthought bolted on at the exit. This function's only job
+# is waiting, the way its name has claimed all along.
 pause_for_return() {
-        tput ed
         echo
         printf '  %sPress any key to continue...%s' "$C_DIM" "$C_RESET"
-        read_key >/dev/null
+        local key
+        while true; do
+                key=$(read_key)
+                if [[ "$key" == "RESIZE" ]]; then
+                        # Same tradeoff as confirm()'s RESIZE handling: the
+                        # action output above is gone, but staring at a
+                        # garbled screen forever is worse than an honest
+                        # blank one asking you to press a key.
+                        clear
+                        printf '  %sPress any key to continue...%s' "$C_DIM" "$C_RESET"
+                        continue
+                fi
+                break
+        done
         echo
 }
 
@@ -507,9 +620,17 @@ resolve_editor() {
 # mechanism that caused the flicker you complained about: blank frame,
 # then full frame, every single keypress, forever. `tput cup 0 0` gets
 # the one thing we actually needed (cursor back at the top-left) without
-# the accompanying screen-wide flash. New content is drawn directly over
-# old content; anything shorter than the previous frame gets swept up
-# later by `tput ed` in pause_for_return / render_menu_screen, not here.
+# the accompanying screen-wide flash.
+#
+# This function only ever paints ITS OWN four lines and stops — it does
+# not erase anything below itself. That's deliberate: it's called from
+# render_menu_screen on EVERY arrow key, so anything it did beyond its
+# own four lines would happen at keystroke frequency, not screen-change
+# frequency, and you'd be right back to flickering. Whoever calls this
+# and needs the rest of the screen guaranteed clean (begin_action_screen,
+# show_interactive_menu) is responsible for doing that erase themselves,
+# exactly once, at the point where a genuinely new screen begins — not
+# in here.
 draw_screen_header() {
         local title="$1"
         tput cup 0 0
@@ -520,11 +641,27 @@ draw_screen_header() {
 }
 
 # Start a one-shot action screen (git status, a diff, sync output, etc).
-# Just a thin, readable name for draw_screen_header at call sites that
-# aren't menus — same header, different intent, same energy as you
-# renaming a variable instead of fixing the bug in it.
+#
+# BUG YOU FOUND (image 2/3 — the full Git menu still sitting there behind
+# "Commit message:"): this used to be a one-line pass-through to
+# draw_screen_header and nothing else. draw_screen_header only paints
+# ITS OWN four lines (rule, title, rule, blank) — it was never told to
+# touch anything below that, on purpose, because render_menu_screen also
+# calls draw_screen_header on every single arrow-key press, and erasing
+# the whole screen on every arrow key is the exact flicker you started
+# this whole refactor to get rid of.
+#
+# But action screens aren't like menus — begin_action_screen runs ONCE
+# per screen, not once per keystroke, so there's no flicker risk in
+# giving it its own one-time `tput ed` right here, right after the
+# header, before a single byte of the screen's actual content (a git
+# diff, a commit prompt, whatever) gets drawn on top of it. That's the
+# difference between "erase once when the screen changes" (fine, cheap,
+# invisible) and "erase on every keystroke" (the bug you originally
+# complained about). Same instruction, wildly different frequency.
 begin_action_screen() {
         draw_screen_header "$1"
+        tput ed
 }
 
 # Repository summary block shown under the title on the main menu:
@@ -568,11 +705,17 @@ print_status_block() {
 # This is pure rendering — no input handling lives here, a boundary
 # you've apparently managed to respect exactly once in this codebase.
 #
-# `tput ed` at the very end trims anything left behind from a taller
-# previous menu (e.g. Git's 9 items shrinking down to Settings' 6).
-# It runs AFTER the new frame is fully painted on purpose — clearing
-# first would just reintroduce the blank-frame flicker you're trying
-# to get rid of, one function later than before.
+# NO erase call lives in here anymore, on purpose. This function runs on
+# EVERY arrow key while a menu is open — that's the highest-frequency
+# redraw in the whole app, and it's exactly the path the original
+# flicker complaint was about. Within one show_interactive_menu session
+# the title, status block, and item list are all the same length every
+# single time (only which item is highlighted changes), so overwriting
+# in place is already leftover-free — there is nothing here that ever
+# needs erasing between keystrokes. The one-time erase for when the
+# screen ACTUALLY changes shape lives in show_interactive_menu, once,
+# before this loop starts — not in here, where it would run every time
+# you tapped an arrow key.
 render_menu_screen() {
         local title="$1" show_status="$2" selected="$3"
         shift 3
@@ -599,7 +742,6 @@ render_menu_screen() {
         print_rule "─"
         printf '  %s↑↓/jk%s Move   %sEnter%s Select   %sEsc%s Back   %sq%s Quit   %s?%s Help\n' \
                 "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
-        tput ed
 }
 
 # The single, reusable interactive menu. Every menu in this app — main,
@@ -621,6 +763,16 @@ render_menu_screen() {
 # below already isolates every state transition into one `case`, so that
 # change stays local to this function — you're welcome, past you did you
 # a favor for once.
+#
+# BUG YOU FOUND (image 1 — "Statusry", the mashed-up title): this is the
+# other half of the fix that lives in begin_action_screen. Every call to
+# show_interactive_menu is a genuinely NEW screen — different title,
+# different item count, maybe a status block that wasn't there before —
+# so, exactly ONCE, before the loop even starts, we erase whatever the
+# previous screen left behind. After that the loop is free to hammer
+# render_menu_screen on every arrow key without ever touching `tput ed`
+# again, because nothing about this menu's shape changes between one
+# keystroke and the next.
 show_interactive_menu() {
         local title="$1" show_status="$2"
         shift 2
@@ -628,6 +780,9 @@ show_interactive_menu() {
         local count=${#items[@]}
         local selected=0
         local key
+
+        tput cup 0 0
+        tput ed
 
         while true; do
                 render_menu_screen "$title" "$show_status" "$selected" "${items[@]}"
@@ -654,6 +809,14 @@ show_interactive_menu() {
                 'KEY:?')
                         show_help_screen
                         ;;
+                RESIZE)
+                        # A resize mid-menu is actually the easy case: the
+                        # items and title are still known and unchanged, so
+                        # a clear + let the loop redraw on the next
+                        # iteration is a full, correct recovery — not a
+                        # best-effort one like the other RESIZE handlers.
+                        clear
+                        ;;
                 *)
                         : # ignore anything we don't recognize and keep waiting
                         ;;
@@ -665,8 +828,16 @@ show_interactive_menu() {
 # dead end by design: read, absorb, press a key, go back to whatever you
 # were doing. No navigation logic needed beyond that — a rare piece of
 # this app that isn't secretly a state machine in disguise.
+#
+# Uses begin_action_screen, not draw_screen_header directly — this is
+# popped open from the MIDDLE of a menu's render loop (see show_help_screen's
+# only caller, inside show_interactive_menu's case statement), which means
+# there's a full menu's worth of items and footer sitting on screen right
+# up until this draws over it. begin_action_screen's one-time erase is
+# exactly what makes sure the help text isn't reading like a ransom note
+# spliced into whatever menu you summoned it from.
 show_help_screen() {
-        draw_screen_header "Help"
+        begin_action_screen "Help"
 
         echo "  ${C_BOLD}Navigation${C_RESET}"
         echo "    ↑ / k        Move selection up"
@@ -1019,10 +1190,12 @@ git_commit() {
         fi
 
         local message
-        restore_terminal_mode
         message=$(prompt_line "Commit message: ")
-        enter_raw_mode
 
+        # prompt_line now returns empty for BOTH "typed nothing" and "hit
+        # Esc" — same outcome either way (cancel), so one check covers both.
+        # This message also does double duty warning about an actually
+        # empty message, in case you really did just hit Enter on nothing.
         if [[ -z "$message" ]]; then
                 print_warning "Empty commit message — cancelling."
                 pause_for_return
@@ -1275,9 +1448,7 @@ settings_repository_path() {
 
         if confirm "Change the repository path?"; then
                 local new_path
-                restore_terminal_mode
                 new_path=$(prompt_line "New path (e.g. ~/dots): ")
-                enter_raw_mode
                 new_path="${new_path/#\~/$HOME}" # bash won't expand a literal ~ for us here, it's not psychic, unlike you'd apparently like it to be
 
                 if [[ -z "$new_path" ]]; then
@@ -1449,6 +1620,15 @@ main() {
         trap 'cleanup_and_exit 130' INT
         trap 'cleanup_and_exit 0' TERM
         trap 'restore_terminal_mode' EXIT
+        # This one didn't exist before, which is exactly why resizing the
+        # terminal mid-session used to leave rules and titles computed for
+        # a width that no longer existed. WINCH just flips a flag — it does
+        # NOT touch the terminal directly from inside a signal handler,
+        # because doing real I/O from a trap is how you get a genuinely
+        # haunted script. read_key notices the flag, reports a "RESIZE"
+        # pseudo-key, and every read_key() call site now knows what to do
+        # with one. Go check them if you don't believe me.
+        trap 'WINDOW_RESIZED=1' WINCH
 
         load_app_settings
         load_tracked_paths
