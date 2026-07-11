@@ -4,13 +4,14 @@
 #
 # Keeps the "real" configuration living in $HOME / ~/.config in sync with
 # a git repository (default: ~/dots), through a lazygit-style menu instead
-# of a wall of numbered prompts.
+# of a wall of numbered prompts. Yes, you built a TUI to avoid typing
+# `cp -r` eleven times. We're all very proud.
 #
 #   Sync     $HOME        -> repository
 #   Restore  repository   -> $HOME
 #
-# Author: generated for Prithvi.
-# License: do whatever you want with it.
+# Author: generated for Prithvi, who definitely did not need this.
+# License: do whatever you want with it. God knows you will anyway.
 #
 # ============================================================================
 # SECTION 1: CONSTANTS
@@ -18,17 +19,22 @@
 #
 #   -E : ERR trap is inherited by functions and subshells, not just the
 #        top-level script. Without this, a failure inside a function you
-#        called from an `if` would be silently swallowed.
+#        called from an `if` would be silently swallowed — much like your
+#        motivation for finishing this project on time.
 #   -e : exit immediately if a command fails, UNLESS that command is part
 #        of a tested construct (if/while/until/&&/||). This is what lets
 #        us handle expected failures (like "nothing to commit") gracefully
-#        instead of the whole program falling over.
+#        instead of the whole program face-planting in front of you.
 #   -u : referencing an unset variable is an error, not an empty string.
+#        Bash usually lets you get away with this. Bash is being generous
+#        today. You don't deserve it.
 #   -o pipefail : a pipeline's exit status is that of its last *failing*
-#        command, not just its last command.
+#        command, not just its last command — because silently ignoring
+#        errors is a personality trait, not a bash feature.
 #
 # Together these are Bash's version of wearing a seatbelt, a helmet, and
 # also texting your mom before a road trip. A little paranoid. Correct.
+# Somebody in this relationship has to be.
 set -Eeuo pipefail
 
 readonly APP_VERSION="1.0.0"
@@ -36,24 +42,30 @@ readonly APP_VERSION="1.0.0"
 # Where this tool keeps its OWN configuration: which paths are tracked,
 # and small settings like the repository location and color theme.
 # This lives outside the script on purpose — "Edit tracked paths" opens a
-# small, safe data file, not 700 lines of control flow.
+# small, safe data file, not 700 lines of control flow you'll immediately
+# regret touching at 2am.
 readonly APP_CONFIG_DIR="$HOME/.config/dotfiles-manager"
 readonly PATHS_CONFIG_FILE="$APP_CONFIG_DIR/paths.conf"
 readonly APP_SETTINGS_FILE="$APP_CONFIG_DIR/settings.conf"
 
 # Mutable globals. Bash has no real notion of "private" state, so we keep
-# the list short and document each one instead of pretending otherwise.
+# the list short and document each one instead of pretending otherwise —
+# unlike your dotfiles, which have no notion of "minimal" either.
 REPO_DIR=""          # set by load_app_settings
 THEME_NAME="default" # set by load_app_settings
 DIRECTORIES=()       # set by load_tracked_paths
 FILES=()             # set by load_tracked_paths
 MENU_RESULT=""       # set by show_interactive_menu; read by its callers
-ORIGINAL_STTY=""     # saved terminal settings, for restore on exit
+ORIGINAL_STTY=""     # saved terminal settings, for restore on exit — lose
+                      # this and someone's shell stays invisible forever,
+                      # which is a bold way to make an enemy
 
 # Seed values for the tracked-paths config file. These are only ever used
 # once, the very first time the app runs and PATHS_CONFIG_FILE doesn't
 # exist yet. After that, the config file is the single source of truth —
 # nothing below this point should ever hardcode a dotfile path again.
+# If you're reading this because you hardcoded one anyway: go fix it,
+# then come back and feel bad.
 readonly -a DEFAULT_DIRECTORIES=(
         ".config/custom"
         ".config/hypr/custom"
@@ -67,7 +79,8 @@ readonly -a DEFAULT_FILES=(
 )
 
 # Icons. These don't change with the theme — Unicode glyphs cost the same
-# number of bytes whether your terminal is pink or beige.
+# number of bytes whether your terminal is pink or beige, and yes, you
+# will pick pink.
 readonly ICON_OK="✓"
 readonly ICON_ERR="✗"
 readonly ICON_WARN="⚠"
@@ -77,6 +90,8 @@ readonly ICON_FILE="📄"
 readonly ICON_SYNC="🔄"
 readonly ICON_ROCKET="🚀"
 
+# A whole array dedicated to insulting you on your way out. This took
+# longer to write than the sync logic. Priorities.
 readonly -a EXIT_MESSAGES=(
         "Go study DSA. Your configs are optimized enough."
         "Your Neovim config still isn't finished. Nice try."
@@ -172,15 +187,16 @@ readonly -a EXIT_MESSAGES=(
 # ============================================================================
 #
 # C_RESET/C_BOLD/C_DIM are terminal primitives, not "colors" — they stay
-# the same no matter which theme is active. C_ACCENT/C_GREEN/C_RED/
-# C_YELLOW/C_BLUE are the themeable palette, swapped out by apply_theme().
+# the same no matter which theme is active, unlike your opinions on
+# tiling window managers, which change weekly.
 if [[ -t 1 ]]; then
         C_RESET=$'\033[0m'
         C_BOLD=$'\033[1m'
         C_DIM=$'\033[2m'
 else
         # Not a terminal (piped to a file, redirected, etc). Degrade to plain
-        # text rather than filling a log file with escape-code soup.
+        # text rather than filling a log file with escape-code soup nobody
+        # asked to read.
         C_RESET=""
         C_BOLD=""
         C_DIM=""
@@ -192,13 +208,15 @@ C_YELLOW=""
 C_BLUE=""
 
 # Swap the themeable palette. Called once at startup, and again whenever
-# the user changes it from Settings > Theme.
+# you get bored at 1am and decide the app needs "a different vibe."
 #
 # "default" is plain 8-color ANSI: it works literally everywhere, including
-# that one TTY without a GPU you SSH into at 3am to fix something on fire.
+# that one TTY without a GPU you SSH into at 3am to fix something on fire
+# that you started.
 #
-# "mocha" is Catppuccin Mocha, using 24-bit truecolor escapes. Almost every
-# terminal from the last decade supports it (foot and kitty certainly do).
+# "mocha" is Catppuccin Mocha, using 24-bit truecolor escapes, because
+# obviously you couldn't ship a terminal tool in 2024+ without it. It was
+# never optional, was it.
 apply_theme() {
         local theme="${1:-default}"
 
@@ -236,7 +254,8 @@ apply_theme() {
 # ============================================================================
 
 # Terminal width, falling back to 80 columns if it can't be determined
-# (e.g. no controlling terminal). Used to draw rules and center titles.
+# (e.g. no controlling terminal). 80 columns: the default width of your
+# self-esteem when a build fails.
 term_width() {
         tput cols 2>/dev/null || echo 80
 }
@@ -251,6 +270,8 @@ print_rule() {
 }
 
 # Print text centered within the terminal width, in an optional color.
+# Centering text is the one thing in this entire project that's actually
+# balanced.
 # Usage: print_centered "some text" "$C_BOLD$C_ACCENT"
 print_centered() {
         local text="$1"
@@ -264,20 +285,24 @@ print_centered() {
 
 # Replace a leading $HOME with ~, purely for display. Defined once so the
 # same shortening logic isn't retyped in a dozen different echo statements
-# (and so it's easy to change later if we ever want, say, full paths).
+# (and so it's easy to change later if we ever want, say, full paths —
+# something you will absolutely ask for in six months and forget you're
+# the one who removed it).
 shorten_path() {
         printf '%s' "${1/#$HOME/~}"
 }
 
 # Standardized message helpers. Every screen in the app uses these instead
-# of ad-hoc `echo`, so the look-and-feel stays consistent by construction.
+# of ad-hoc `echo`, so the look-and-feel stays consistent by construction —
+# the one form of consistency you've managed to enforce anywhere.
 print_success() { echo "  ${C_GREEN}${ICON_OK}${C_RESET} $1"; }
 print_error() { echo "  ${C_RED}${ICON_ERR}${C_RESET} $1" >&2; }
 print_warning() { echo "  ${C_YELLOW}${ICON_WARN}${C_RESET} $1"; }
 print_info() { echo "  ${C_BLUE}${ICON_ARROW}${C_RESET} $1"; }
 
 # Print a two-count-plus-errors summary block, shared by sync and restore
-# so the formatting logic exists in exactly one place.
+# so the formatting logic exists in exactly one place, instead of the two
+# slightly-different copy-pasted places you'd have left it in.
 # Usage: print_summary "Sync summary" "Directories synced" "$n" "Files copied" "$m" "$errors"
 print_summary() {
         local title="$1" label_a="$2" count_a="$3" label_b="$4" count_b="$5" errors="$6"
@@ -294,6 +319,8 @@ print_summary() {
         print_rule "─"
 }
 
+# Pick a random insult from the array above. This function has a better
+# hit rate than your last ten pull requests.
 random_exit_message() {
         printf '%s\n' "${EXIT_MESSAGES[RANDOM % ${#EXIT_MESSAGES[@]}]}"
 }
@@ -306,22 +333,33 @@ random_exit_message() {
 # and exactly ONE function that reads a free-text line (prompt_line).
 # Every prompt, menu, and confirmation in this app is built on top of
 # these two — no scattered `read -p` calls reinventing the same thing
-# slightly differently in five places.
+# slightly differently in five places, which is exactly what you would
+# have done given the chance.
 
 # Put the terminal into "raw-ish" (cbreak) mode: keys are delivered to us
 # one at a time, immediately, without waiting for Enter, and without the
 # terminal echoing them back at us. This is what makes arrow-key/hjkl
 # navigation possible at all — canonical mode would buffer every keypress
 # until the user hits Enter, which is not the vibe we're going for.
+#
+# NOTE: this is also the reentry point after an external program (nvim,
+# your editor of choice, whatever) has trashed the whole screen with its
+# own UI. `clear` here is the ONE deliberate exception to "never clear
+# after startup" — the editor painted content we have zero knowledge of
+# and zero way to diff against, so there is nothing smart to do except
+# wipe it and start over. If you "clean this up" by deleting the clear,
+# enjoy your new career debugging garbled leftover Vim splash screens.
 enter_raw_mode() {
         ORIGINAL_STTY=$(stty -g 2>/dev/null) || true
         stty -icanon -echo min 1 time 0 2>/dev/null || true
         tput civis 2>/dev/null || true # hide the cursor while we're driving menus
+        clear
 }
 
 # Put the terminal back the way we found it. Called on every exit path —
 # normal quit, error, or Ctrl+C — because leaving someone's terminal
-# stuck in raw mode is the kind of thing that ruins an evening.
+# stuck in raw mode is the kind of thing that ruins an evening, and
+# yours has had enough of those already.
 restore_terminal_mode() {
         if [[ -n "$ORIGINAL_STTY" ]]; then
                 stty "$ORIGINAL_STTY" 2>/dev/null || true
@@ -336,7 +374,8 @@ restore_terminal_mode() {
 # (ESC, then '[', then a letter), a convention terminals have followed
 # since the VT100. We read the ESC, then race a very short timeout
 # against a second read: if two more bytes show up almost instantly,
-# it was an arrow key; if nothing follows, it was just a lonely Esc.
+# it was an arrow key; if nothing follows, it was just a lonely Esc,
+# not unlike your commitment to any given hobby.
 read_key() {
         local key seq
         IFS= read -rsn1 key || true
@@ -372,7 +411,8 @@ read_key() {
 
 # Read one line of free text (commit messages, paths, etc). Temporarily
 # hands the terminal back to normal cooked mode with the cursor visible,
-# since that's what a person typing a sentence actually wants.
+# since that's what a person typing a sentence actually wants — a
+# concept you apparently needed a whole function to arrive at.
 prompt_line() {
         local prompt="$1"
         local input
@@ -384,7 +424,7 @@ prompt_line() {
 # "read a key from the user" logic anywhere in this file. Defaults to
 # "no" on anything but an explicit y/Y, since this guards destructive
 # operations (restore, checkout) where the safe default matters more
-# than saving a keystroke.
+# than saving a keystroke — a rare moment of restraint from you.
 # Usage: if confirm "Are you sure?"; then ... fi
 confirm() {
         local prompt="$1" key
@@ -400,14 +440,25 @@ confirm() {
                         echo
                         return 1
                         ;;
-                *) : ;; # anything else: keep waiting, don't guess
+                *) : ;; # anything else: keep waiting, don't guess — unlike you at 3am with rm -rf
                 esac
         done
 }
 
 # Wait for any keypress before redrawing whatever comes next. Gives the
-# user a moment to actually read the output of the action they just ran.
+# user a moment to actually read the output of the action they just ran,
+# a courtesy you rarely extend to yourself in git commit messages.
+#
+# Since we stopped nuking the whole screen with `clear` on every redraw,
+# this is also the designated cleanup spot: by the time we get here, the
+# current action screen has finished printing everything it's going to
+# print, so it's the safest place to erase any stale leftover lines from
+# a taller previous frame (e.g. a long `git diff` sticking around under
+# a short "nothing to commit" message). `tput ed` erases from the cursor
+# to the bottom of the screen — cheap, and it never produces the blank-
+# frame flash a full `clear` would.
 pause_for_return() {
+        tput ed
         echo
         printf '  %sPress any key to continue...%s' "$C_DIM" "$C_RESET"
         read_key >/dev/null
@@ -417,7 +468,8 @@ pause_for_return() {
 # Run an external, full-screen program (an editor, basically) with the
 # terminal restored to normal mode, then put our raw mode back afterward.
 # Without this, launching nvim while we're sitting in -icanon/-echo with
-# the cursor hidden would make for a very confusing few seconds.
+# the cursor hidden would make for a very confusing few seconds — and
+# you'd file it as "bash is broken" instead of reading your own code.
 run_external_program() {
         restore_terminal_mode
         local status=0
@@ -429,7 +481,8 @@ run_external_program() {
 # Find the best available editor. Preference order: the user's own
 # $EDITOR/$VISUAL, then a fallback chain from "full-featured" to
 # "definitely installed everywhere." Centralized here so nothing else
-# in this file hardcodes an editor name.
+# in this file hardcodes an editor name — because we both know which
+# editor you'd have hardcoded, and it would've started a flame war.
 resolve_editor() {
         local candidate
         for candidate in "${EDITOR:-}" "${VISUAL:-}" nvim vim micro nano; do
@@ -448,9 +501,18 @@ resolve_editor() {
 
 # Draw a screen header: a title bar with an optional breadcrumb, used by
 # both full menus and one-shot action screens so they share a look.
+#
+# THIS USED TO CALL `clear`. It doesn't anymore. `clear` blanks the whole
+# terminal and resets the cursor as a side effect — which is exactly the
+# mechanism that caused the flicker you complained about: blank frame,
+# then full frame, every single keypress, forever. `tput cup 0 0` gets
+# the one thing we actually needed (cursor back at the top-left) without
+# the accompanying screen-wide flash. New content is drawn directly over
+# old content; anything shorter than the previous frame gets swept up
+# later by `tput ed` in pause_for_return / render_menu_screen, not here.
 draw_screen_header() {
         local title="$1"
-        clear
+        tput cup 0 0
         print_rule "─"
         print_centered "$title" "${C_BOLD}${C_ACCENT}"
         print_rule "─"
@@ -459,7 +521,8 @@ draw_screen_header() {
 
 # Start a one-shot action screen (git status, a diff, sync output, etc).
 # Just a thin, readable name for draw_screen_header at call sites that
-# aren't menus — same header, different intent.
+# aren't menus — same header, different intent, same energy as you
+# renaming a variable instead of fixing the bug in it.
 begin_action_screen() {
         draw_screen_header "$1"
 }
@@ -467,7 +530,8 @@ begin_action_screen() {
 # Repository summary block shown under the title on the main menu:
 # path, current branch, clean/dirty, and how many paths are tracked.
 # Nothing here is fatal if the repo doesn't exist yet — the point of
-# this block is partly to make that obvious at a glance.
+# this block is partly to make that obvious at a glance, since you
+# will absolutely forget you never ran `git init`.
 print_status_block() {
         local branch status_label status_color
 
@@ -501,7 +565,14 @@ print_status_block() {
 
 # Render one full menu screen: header, optional status block, the item
 # list with the current selection highlighted, and a footer key legend.
-# This is pure rendering — no input handling lives here.
+# This is pure rendering — no input handling lives here, a boundary
+# you've apparently managed to respect exactly once in this codebase.
+#
+# `tput ed` at the very end trims anything left behind from a taller
+# previous menu (e.g. Git's 9 items shrinking down to Settings' 6).
+# It runs AFTER the new frame is fully painted on purpose — clearing
+# first would just reintroduce the blank-frame flicker you're trying
+# to get rid of, one function later than before.
 render_menu_screen() {
         local title="$1" show_status="$2" selected="$3"
         shift 3
@@ -528,11 +599,13 @@ render_menu_screen() {
         print_rule "─"
         printf '  %s↑↓/jk%s Move   %sEnter%s Select   %sEsc%s Back   %sq%s Quit   %s?%s Help\n' \
                 "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+        tput ed
 }
 
 # The single, reusable interactive menu. Every menu in this app — main,
 # Git, Tracked Files, Settings, Theme, Branches — calls this instead of
-# hand-rolling its own selection loop.
+# hand-rolling its own selection loop, because six copies of the same
+# 40-line while-loop is a crime scene, not an architecture.
 #
 # Sets the global MENU_RESULT to one of:
 #   an integer index into the items you passed in, or
@@ -541,7 +614,13 @@ render_menu_screen() {
 #     help screen and simply redraws this same menu afterward.
 #   'q' exits the whole application immediately and never returns here.
 #
-# Usage: show_interactive_menu "Title" <show_status 0|1> "Item one" "Item two" ...
+# Note for future-you doing the "redraw only what changed" pass: this is
+# where you'll want to stop calling render_menu_screen() on every arrow
+# key and instead track `selected` vs. the previous selection, moving the
+# cursor to just those two item lines and repainting only them. The loop
+# below already isolates every state transition into one `case`, so that
+# change stays local to this function — you're welcome, past you did you
+# a favor for once.
 show_interactive_menu() {
         local title="$1" show_status="$2"
         shift 2
@@ -584,7 +663,8 @@ show_interactive_menu() {
 
 # The help screen, reachable with '?' from literally any menu. It's a
 # dead end by design: read, absorb, press a key, go back to whatever you
-# were doing. No navigation logic needed beyond that.
+# were doing. No navigation logic needed beyond that — a rare piece of
+# this app that isn't secretly a state machine in disguise.
 show_help_screen() {
         draw_screen_header "Help"
 
@@ -612,7 +692,8 @@ show_help_screen() {
 # Create the tracked-paths config file with sensible defaults the first
 # time the app runs. If you think you'll remember, six months from now,
 # which fifteen directories you actually cared about — you won't. That's
-# what this file is for.
+# what this file is for. We know you. This entire function is a trust
+# issue given a file extension.
 ensure_paths_config_exists() {
         mkdir -p "$APP_CONFIG_DIR"
 
@@ -649,6 +730,9 @@ ensure_paths_config_exists() {
 }
 
 # Source the tracked-paths file to (re)populate DIRECTORIES and FILES.
+# Yes, this `source`s a file that lives in your $HOME tree, which means
+# your dotfiles manager's behavior is itself a dotfile. Recursion you
+# didn't ask for but absolutely earned.
 load_tracked_paths() {
         ensure_paths_config_exists
         # shellcheck source=/dev/null
@@ -658,7 +742,9 @@ load_tracked_paths() {
 
 # Load app-level settings (repository path, theme) with sensible defaults,
 # then let a saved settings file override them, then let an explicit
-# environment variable override THAT — env vars win, for scripting.
+# environment variable override THAT — env vars win, for scripting,
+# because someone in this codebase has to respect the twelve-factor app
+# people, and it's not going to be the 1300-line bash script.
 load_app_settings() {
         REPO_DIR="$HOME/dots"
         THEME_NAME="default"
@@ -677,6 +763,8 @@ load_app_settings() {
 }
 
 # Persist the current REPO_DIR / THEME_NAME so they survive a restart.
+# The comment in the generated file says "feel free to hand-edit" — we
+# both know you will, and we both know it'll break something.
 save_app_settings() {
         mkdir -p "$APP_CONFIG_DIR"
         {
@@ -693,13 +781,15 @@ save_app_settings() {
 # ============================================================================
 
 # Silent check: does the repository exist and is it actually a git repo?
-# Used anywhere we just need a boolean, without printing anything.
+# Used anywhere we just need a boolean, without printing anything —
+# unlike you, who prints anyway.
 repo_is_valid() {
         [[ -d "$REPO_DIR" && -d "$REPO_DIR/.git" ]]
 }
 
 # Loud check: same as above, but explains itself when it fails. Every
-# action that touches the repo calls this first.
+# action that touches the repo calls this first, because "silently do
+# nothing" is not a UX, it's a bug you haven't noticed yet.
 # Usage: if ! require_repo; then pause_for_return; return; fi
 require_repo() {
         if repo_is_valid; then
@@ -713,7 +803,7 @@ require_repo() {
 
 # Current branch name, or "-" if there isn't a valid repo (or no commits
 # yet). Deliberately never fails outright — it's used in a lot of places
-# that just want something to print.
+# that just want something to print, much like your commit messages.
 current_branch() {
         if repo_is_valid; then
                 git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "-"
@@ -723,7 +813,8 @@ current_branch() {
 }
 
 # Is the working tree clean (no staged or unstaged changes)? Git
-# remembers everything — unlike me before coffee — so this is exact.
+# remembers everything — unlike you before coffee — so this is exact,
+# which is more than can be said for your memory of what you changed.
 is_repo_clean() {
         if ! repo_is_valid; then
                 return 1
@@ -766,6 +857,7 @@ action_sync() {
                         # repo too. That's the intended behavior, not a bug — but it's
                         # also exactly the kind of flag you want to understand before
                         # you trust it. Read your diffs before you push. Trust, verify.
+                        # You've been burned by this exact flag before and you know it.
                         if rsync -a --delete "$src"/ "$dest"/; then
                                 print_success "${ICON_DIR} ~/$rel_path"
                                 ((++dirs_synced))
@@ -820,6 +912,9 @@ action_restore() {
         print_warning "This will OVERWRITE files in \$HOME with the versions"
         print_warning "currently stored in $(shorten_path "$REPO_DIR")."
         echo
+        # This confirm() is the only thing standing between you and
+        # overwriting a week of unsaved config changes because you fat-
+        # fingered a menu item. Do not remove it to "streamline the flow."
         if ! confirm "Continue with restore?"; then
                 print_info "Restore cancelled."
                 pause_for_return
@@ -943,7 +1038,8 @@ git_commit() {
         # Checking for "nothing staged" ourselves, instead of letting `git
         # commit` fail, avoids a very abrupt way to learn your tree was
         # already clean. This function has one job: commit. If it starts
-        # doing more, congratulations, you've invented technical debt.
+        # doing more, congratulations, you've invented technical debt —
+        # again, this makes at least three times this week.
         if git -C "$REPO_DIR" diff --cached --quiet; then
                 print_warning "Nothing to commit — working tree is clean."
                 pause_for_return
@@ -1011,7 +1107,8 @@ git_history() {
 
 # Interactive branch list: pick one to check out, or go Back. This is its
 # own little menu loop (not a single action), so it manages its own
-# pausing per selection rather than relying on its caller.
+# pausing per selection rather than relying on its caller — the one
+# function in this app pulling its own weight without being told to.
 git_branches_menu() {
         if ! repo_is_valid; then
                 begin_action_screen "Git › Branches"
@@ -1181,7 +1278,7 @@ settings_repository_path() {
                 restore_terminal_mode
                 new_path=$(prompt_line "New path (e.g. ~/dots): ")
                 enter_raw_mode
-                new_path="${new_path/#\~/$HOME}" # bash won't expand a literal ~ for us here
+                new_path="${new_path/#\~/$HOME}" # bash won't expand a literal ~ for us here, it's not psychic, unlike you'd apparently like it to be
 
                 if [[ -z "$new_path" ]]; then
                         print_warning "No path entered — keeping the current one."
@@ -1301,7 +1398,7 @@ main_menu() {
                 3) tracked_files_menu ;;
                 4) settings_menu ;;
                 5) cleanup_and_exit 0 ;;
-                BACK) : ;; # nowhere further back to go from the main menu
+                BACK) : ;; # nowhere further back to go from the main menu — the buck stops here, unlike your project deadlines
                 esac
         done
 }
@@ -1312,7 +1409,13 @@ main_menu() {
 
 # Restore the terminal and exit. Every exit path in this app — the Exit
 # menu item, pressing q, an unhandled error, or Ctrl+C — routes through
-# here, so the person's shell is never left in a broken state.
+# here, so the person's shell is never left in a broken state, which is
+# more consideration than you show your own future self.
+#
+# The `clear` here is fine and stays — it's the terminal's LAST frame,
+# ever, for this session. That's the one and only other place, besides
+# startup and the post-editor return in enter_raw_mode, where blanking
+# the screen is the correct call instead of the lazy one.
 cleanup_and_exit() {
         local code="${1:-0}"
         restore_terminal_mode
@@ -1326,7 +1429,7 @@ cleanup_and_exit() {
 # Beautiful errors. An uncaught failure anywhere in this script lands
 # here instead of dumping a raw Bash stack trace on someone — a C++
 # segfault at least gives you a core dump; the least Bash can do is give
-# you a sentence.
+# you a sentence, which is more closure than most of your relationships.
 on_error() {
         local exit_code=$? line_no="${1:-unknown}"
         restore_terminal_mode
@@ -1350,6 +1453,8 @@ main() {
         load_app_settings
         load_tracked_paths
         apply_theme "$THEME_NAME"
+        # enter_raw_mode owns the ONE startup `clear` — see its comment
+        # for why it also doubles as the post-editor repaint trigger.
         enter_raw_mode
 
         main_menu
@@ -1357,7 +1462,8 @@ main() {
 
 # Only run main if this script is executed directly, not sourced. This
 # makes it possible to source the file (e.g. from a test harness) and
-# call individual functions without kicking off the interactive app.
+# call individual functions without kicking off the interactive app —
+# assuming you ever write a test harness, which, let's be honest.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         main "$@"
 fi
