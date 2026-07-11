@@ -37,6 +37,31 @@
 # Somebody in this relationship has to be.
 set -Eeuo pipefail
 
+# NEW BUG YOU FOUND ("GitMANAGER" surviving even after the erase-ordering
+# fix, on some runs but not others): every title in this app is centered
+# by print_centered, which pads based on ${#text} — bash's own character
+# count. That count is only accurate when bash's locale is UTF-8-aware.
+# The instant it isn't, ${#text} silently starts counting raw UTF-8
+# BYTES instead of characters, and every title containing a multi-byte
+# glyph — "›" in "Git › Commit", "Settings › Theme", literally every
+# breadcrumb in this app — gets fed a padding number a couple of columns
+# too high, off-centering the title with nothing else in this file doing
+# anything wrong. Whether this bites you depends entirely on whatever
+# locale the shell that launched this script happened to have, which is
+# exactly the kind of "works on my machine" landmine that deserves to be
+# closed off at the source instead of debugged again in six months.
+# Force it here, once, for THIS process only — nothing about the
+# invoking shell or terminal is touched.
+if [[ "$(locale charmap 2>/dev/null)" != "UTF-8" ]]; then
+        for _dotfiles_locale_candidate in en_US.UTF-8 en_US.utf8 C.UTF-8 C.utf8; do
+                if locale -a 2>/dev/null | grep -qi "^${_dotfiles_locale_candidate}$"; then
+                        export LC_ALL="$_dotfiles_locale_candidate"
+                        break
+                fi
+        done
+        unset _dotfiles_locale_candidate
+fi
+
 readonly APP_VERSION="1.0.0"
 
 # Where this tool keeps its OWN configuration: which paths are tracked,
@@ -62,6 +87,18 @@ ORIGINAL_STTY=""     # saved terminal settings, for restore on exit — lose
 WINDOW_RESIZED=0      # set by the WINCH trap, consumed by read_key — the
                       # thing you forgot to even THINK about when you asked
                       # for "flicker-free" and got "corrupted on resize" instead
+
+# Backing state for the action-screen capture/redraw mechanism (see the
+# "SCREEN CAPTURE" block in SECTION 5). This is what makes a resize that
+# happens mid-`git diff`, mid-sync-summary, or mid-"press any key" an
+# actual full recovery instead of the old "clear and hope" approach —
+# everything an action screen has printed is mirrored into a temp file
+# as it's printed, so RESIZE handlers can redraw the real thing instead
+# of admitting defeat.
+SCREEN_TITLE=""       # title of the currently-open action screen, for redraws
+_CAPTURE_FD_READY=0   # whether fd 4 has been set up to mirror the real terminal
+_CAPTURE_ACTIVE=0     # whether fd 1 is currently being tee'd into _CAPTURE_FILE
+_CAPTURE_FILE=""      # temp file holding everything the current screen has printed
 
 # Seed values for the tracked-paths config file. These are only ever used
 # once, the very first time the app runs and PATHS_CONFIG_FILE doesn't
@@ -273,12 +310,35 @@ term_width() {
 # this line." `tput el` (erase-to-end-of-line) does exactly that, and it
 # has to run AFTER the rule is drawn but BEFORE the newline, while the
 # cursor is still sitting on this row and not the next one.
-# Usage: print_rule "─"
+# NEW BUG YOU FOUND (the diamond-glyph dividers in every screenshot):
+# this used to build the line with `printf '%*s' "$width" '' | tr ' '
+# "$char"`. `tr` maps SET1 to SET2 character-for-character — except its
+# idea of a "character" in SET2 is a single BYTE, not a Unicode
+# codepoint, regardless of locale (verified against GNU coreutils 9.4,
+# under both a UTF-8 locale and the C locale: identical result either
+# way). "─" is 3 bytes in UTF-8 (E2 80 94); tr silently truncated SET2
+# to match SET1's length — one character, i.e. one BYTE — so every
+# single space became a lone, orphaned 0xE2. On its own, 0xE2 is an
+# invalid UTF-8 sequence (it's a lead byte demanding two continuation
+# bytes that never came), and every terminal in your screenshots
+# rendered each one as a replacement-character glyph. That's the
+# diamond pattern, byte for byte — not a font problem, not a rendering
+# quirk, an actual corrupted byte stream this script was generating.
+#
+# Fixed by building the line with bash's own `${var// /replacement}`
+# instead of shelling out to `tr` at all: bash treats "$char" as one
+# opaque string being substituted in, not a set of individual bytes to
+# map through, so this is correct no matter how many bytes wide the
+# character is or what locale is active when this runs.
+# Usage: print_rule "─" ["$C_ACCENT"]
 print_rule() {
         local char="${1:--}"
-        local width
+        local color="${2:-$C_DIM}"
+        local width line
         width=$(term_width)
-        printf '%*s' "$width" '' | tr ' ' "$char"
+        printf -v line '%*s' "$width" ''
+        line="${line// /$char}"
+        printf '%s%s%s' "$color" "$line" "$C_RESET"
         tput el
         printf '\n'
 }
@@ -294,6 +354,12 @@ print_rule() {
 # before moving on, whatever the LAST title left behind outside the new
 # title's footprint just... stays there, mashed up against the new one.
 # Same `tput el`-before-newline fix as print_rule, same reason.
+#
+# The OTHER way this padding math could come out wrong — ${#text}
+# quietly counting bytes instead of characters for any title with a
+# multi-byte glyph in it (every "X › Y" breadcrumb qualifies) — is now
+# handled once, at startup, by forcing a UTF-8 locale for this process.
+# See the comment above `set -Eeuo pipefail`. Nothing to do here.
 # Usage: print_centered "some text" "$C_BOLD$C_ACCENT"
 print_centered() {
         local text="$1"
@@ -469,11 +535,32 @@ read_key() {
 # the cursor's line editing back over to the terminal and reintroduce
 # the exact bug this fixes. Search for prompt_line's call sites; if one
 # of them still bookends it with restore/enter, you undid this.
+#
+# NEW BUG YOU FOUND ("it doesn't even show commit output"): every caller
+# of this function uses it as `message=$(prompt_line "...")` — command
+# substitution, which redirects THIS FUNCTION'S stdout into a pipe so
+# bash can capture it into a variable. That's fine for the one line we
+# actually want back. It is not fine for everything else this function
+# used to print to stdout for the user's benefit: the prompt text, the
+# live echo of every character as it's typed, the backspace erase
+# sequences, the resize redraw. None of that ever reached the terminal —
+# it all vanished into the pipe instead, invisibly concatenated onto the
+# front of whatever you typed. You weren't looking at a blank prompt by
+# coincidence; you were typing into a variable, blind, and that variable
+# then contained the prompt text and a doubled-up copy of your own input
+# stuck together, which is what actually got committed. This is the
+#"doesn't show commit output" bug, and it's worse than just cosmetic.
+#
+# Fixed by giving every visual write here an explicit destination of
+# /dev/tty — the controlling terminal itself, independent of whatever
+# stdout has been redirected to for capturing purposes. Only the very
+# last line (the actual return value) still targets the real stdout,
+# because that's the one and only thing any caller should be capturing.
 prompt_line() {
         local prompt="$1"
         local input="" key ch
 
-        printf '  %s' "$prompt"
+        printf '  %s' "$prompt" >/dev/tty
 
         while true; do
                 key=$(read_key)
@@ -486,22 +573,27 @@ prompt_line() {
                         break
                         ;;
                 RESIZE)
-                        # Not much we can salvage mid-typing on a resize —
-                        # clearing and reprinting is the honest option
-                        # rather than leaving a half-corrupted prompt.
-                        clear
-                        printf '  %s%s' "$prompt" "$input"
+                        # Full recovery, not best-effort: redraw_action_screen
+                        # still has everything this action screen printed
+                        # before we got here (see SECTION 5's "SCREEN
+                        # CAPTURE" block), so we can restore the whole
+                        # screen and then just reprint our own prompt line
+                        # on top — not merely blank the screen and hope.
+                        {
+                                redraw_action_screen
+                                printf '  %s%s' "$prompt" "$input"
+                        } >/dev/tty
                         ;;
                 'KEY:'$'\x7f' | 'KEY:'$'\x08')
                         if [[ -n "$input" ]]; then
                                 input="${input%?}"
-                                printf '\b \b'
+                                printf '\b \b' >/dev/tty
                         fi
                         ;;
                 KEY:*)
                         ch="${key#KEY:}"
                         input+="$ch"
-                        printf '%s' "$ch"
+                        printf '%s' "$ch" >/dev/tty
                         ;;
                 *)
                         : # arrows etc. mean nothing to a text field, ignore them
@@ -509,7 +601,7 @@ prompt_line() {
                 esac
         done
 
-        echo
+        printf '\n' >/dev/tty
         printf '%s' "$input"
 }
 
@@ -534,10 +626,15 @@ confirm() {
                         return 1
                         ;;
                 RESIZE)
-                        # Best-effort: we can't redraw content we no longer
-                        # have, but re-showing the question beats leaving a
-                        # corrupted line up while you wait for an answer.
-                        clear
+                        # Used to be best-effort — clear the whole screen
+                        # and show only the question, throwing away
+                        # whatever content (a diff, a warning, a summary)
+                        # was sitting above it. redraw_action_screen keeps
+                        # a copy of everything this screen has printed
+                        # since begin_action_screen, so this is now a real
+                        # recovery: the actual screen, then the question,
+                        # not a blank one standing in for it.
+                        redraw_action_screen
                         printf '  %s%s%s %s %s[y/N]%s ' "$C_YELLOW" "$ICON_WARN" "$C_RESET" "$prompt" "$C_DIM" "$C_RESET"
                         ;;
                 *) : ;; # anything else: keep waiting, don't guess — unlike you at 3am with rm -rf
@@ -565,11 +662,12 @@ pause_for_return() {
         while true; do
                 key=$(read_key)
                 if [[ "$key" == "RESIZE" ]]; then
-                        # Same tradeoff as confirm()'s RESIZE handling: the
-                        # action output above is gone, but staring at a
-                        # garbled screen forever is worse than an honest
-                        # blank one asking you to press a key.
-                        clear
+                        # Same fix as confirm()'s RESIZE handling: a real
+                        # redraw of whatever this screen printed — the git
+                        # diff, the sync summary, the error — instead of a
+                        # blank screen standing in for content we used to
+                        # just throw away.
+                        redraw_action_screen
                         printf '  %sPress any key to continue...%s' "$C_DIM" "$C_RESET"
                         continue
                 fi
@@ -584,10 +682,19 @@ pause_for_return() {
 # the cursor hidden would make for a very confusing few seconds — and
 # you'd file it as "bash is broken" instead of reading your own code.
 run_external_program() {
+        # An editor redrawing its own full screen has nothing to do with
+        # OUR redraw buffer, and piping every byte of its output through
+        # tee first would only add latency to every keystroke you type in
+        # it. Pause the capture (fd 1 goes straight back to the real
+        # terminal) rather than tearing it down — _capture_resume reopens
+        # the SAME file in append mode, so nothing captured before the
+        # editor ran is lost.
+        _capture_pause
         restore_terminal_mode
         local status=0
         "$@" || status=$?
         enter_raw_mode
+        _capture_resume
         return "$status"
 }
 
@@ -640,6 +747,73 @@ draw_screen_header() {
         echo
 }
 
+# --- SCREEN CAPTURE ---------------------------------------------------------
+#
+# NEW BUG YOU FOUND ("not optimal for terminal resize"): confirm() and
+# pause_for_return() used to handle a mid-screen RESIZE by calling plain
+# `clear` and reprinting only their OWN one line — the question, or
+# "press any key". Whatever the action screen had actually printed above
+# that (a git diff, a sync summary, an error) was just gone, replaced by
+# blank space, because nothing had kept a copy of it. That was flagged
+# as a "v2.0, needs a redraw-callback architecture" limitation. This is
+# that architecture, and it turns out not to need much: every action
+# screen's output already flows through one file descriptor (stdout), so
+# instead of teaching every single screen how to redraw itself, we just
+# mirror that one descriptor into a temp file as it's written, and hand
+# the file back to whoever needs to redraw.
+#
+# The naive version of "mirror stdout to a file" is `command | tee
+# file`, and it's wrong here for a specific reason: a pipeline forks the
+# command on its LEFT into a subshell in bash, and action_sync/
+# action_restore increment plain shell counters (dirs_synced,
+# files_copied, errors) as they print each line. Do that inside a
+# subshell and those increments evaporate the moment the pipe closes —
+# right before the summary that reads them gets printed. `exec >
+# >(tee -a file >&N)` sidesteps this entirely: it's a redirection of the
+# CURRENT shell's stdout, not a pipeline, so nothing here ever forks.
+_capture_pause() {
+        ((_CAPTURE_ACTIVE)) || return 0
+        exec 1>&4
+        _CAPTURE_ACTIVE=0
+}
+
+_capture_resume() {
+        ((_CAPTURE_ACTIVE)) && return 0
+        ((_CAPTURE_FD_READY)) || return 0
+        [[ -n "$_CAPTURE_FILE" ]] || return 0
+        exec > >(tee -a "$_CAPTURE_FILE" >&4) || true
+        _CAPTURE_ACTIVE=1
+}
+
+# Tear down whatever the PREVIOUS action screen was capturing (if any)
+# and start fresh for a new one. Failure to create the temp file (a
+# read-only /tmp, say) just leaves capture off for this screen instead
+# of taking the whole app down with it — a resize losing its redraw is a
+# much smaller problem than `set -e` deciding a missing scratch file is
+# fatal.
+_capture_new_screen() {
+        _capture_pause
+        [[ -n "$_CAPTURE_FILE" ]] && rm -f "$_CAPTURE_FILE" 2>/dev/null
+        if ((!_CAPTURE_FD_READY)); then
+                exec 4>&1 && _CAPTURE_FD_READY=1
+        fi
+        _CAPTURE_FILE=$(mktemp "${TMPDIR:-/tmp}/dotfiles-screen.XXXXXX" 2>/dev/null) || _CAPTURE_FILE=""
+        _capture_resume
+}
+
+# Redraw the current action screen from scratch: header, then everything
+# captured since begin_action_screen. This is what confirm(), prompt_line
+# and pause_for_return now call on RESIZE instead of a bare `clear` — the
+# difference between "the screen you were looking at, back again" and
+# "a blank one standing in for it".
+redraw_action_screen() {
+        draw_screen_header "$SCREEN_TITLE"
+        tput ed
+        if [[ -n "$_CAPTURE_FILE" && -s "$_CAPTURE_FILE" ]]; then
+                cat "$_CAPTURE_FILE"
+        fi
+}
+
 # Start a one-shot action screen (git status, a diff, sync output, etc).
 #
 # BUG YOU FOUND (image 2/3 — the full Git menu still sitting there behind
@@ -662,6 +836,8 @@ draw_screen_header() {
 begin_action_screen() {
         draw_screen_header "$1"
         tput ed
+        SCREEN_TITLE="$1"
+        _capture_new_screen
 }
 
 # Repository summary block shown under the title on the main menu:
