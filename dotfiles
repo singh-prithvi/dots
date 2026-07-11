@@ -1,280 +1,661 @@
 #!/usr/bin/env bash
 #
-# dotfiles - Interactive terminal application for managing dotfiles
+# dotfiles — an interactive terminal application for managing dotfiles.
 #
-# Repository layout assumption:
-#   - Git repo lives at:      ~/dots
-#   - Real config files live: ~/.config/... and a few directly in $HOME
+# Keeps the "real" configuration living in $HOME / ~/.config in sync with
+# a git repository (default: ~/dots), through a lazygit-style menu instead
+# of a wall of numbered prompts.
 #
-# This script keeps a mirror of the "real" files inside the git repo so
-# that the repo can be committed/pushed/pulled like any normal project.
+#   Sync     $HOME        -> repository
+#   Restore  repository   -> $HOME
 #
-# Author: (generated for Prithvi)
+# Author: generated for Prithvi.
 # License: do whatever you want with it.
 #
-# ---------------------------------------------------------------------------
-# SAFETY / SHELL OPTIONS
-# ---------------------------------------------------------------------------
-#   -E : ERR trap is inherited by shell functions
-#   -e : exit immediately if a command exits with a non-zero status
-#        (commands tested in `if`/`while`/`&&`/`||` are exempt, which is
-#        what lets us handle failures gracefully instead of crashing)
-#   -u : treat unset variables as an error
-#   -o pipefail : a pipeline fails if any command in it fails, not just the last
+# ============================================================================
+# SECTION 1: CONSTANTS
+# ============================================================================
+#
+#   -E : ERR trap is inherited by functions and subshells, not just the
+#        top-level script. Without this, a failure inside a function you
+#        called from an `if` would be silently swallowed.
+#   -e : exit immediately if a command fails, UNLESS that command is part
+#        of a tested construct (if/while/until/&&/||). This is what lets
+#        us handle expected failures (like "nothing to commit") gracefully
+#        instead of the whole program falling over.
+#   -u : referencing an unset variable is an error, not an empty string.
+#   -o pipefail : a pipeline's exit status is that of its last *failing*
+#        command, not just its last command.
+#
+# Together these are Bash's version of wearing a seatbelt, a helmet, and
+# also texting your mom before a road trip. A little paranoid. Correct.
 set -Eeuo pipefail
 
-# ---------------------------------------------------------------------------
-# GLOBAL CONFIGURATION
-# ---------------------------------------------------------------------------
-# Where the git repository that mirrors your dotfiles lives.
-readonly REPO_DIR="${DOTFILES_REPO:-$HOME/dots}"
+readonly APP_VERSION="2.0.0"
 
-# Where this tool stores its own configuration (the list of tracked paths).
-# Keeping this OUTSIDE the script itself means "Edit tracked paths" can
-# open a small, safe config file instead of asking the user to hand-edit
-# a bash script full of logic.
+# Where this tool keeps its OWN configuration: which paths are tracked,
+# and small settings like the repository location and color theme.
+# This lives outside the script on purpose — "Edit tracked paths" opens a
+# small, safe data file, not 700 lines of control flow.
 readonly APP_CONFIG_DIR="$HOME/.config/dotfiles-manager"
 readonly PATHS_CONFIG_FILE="$APP_CONFIG_DIR/paths.conf"
+readonly APP_SETTINGS_FILE="$APP_CONFIG_DIR/settings.conf"
 
-# ---------------------------------------------------------------------------
-# COLORS & ICONS (ANSI escape codes)
-# ---------------------------------------------------------------------------
-# Guard against non-terminal output (e.g. piping to a file) by only
-# enabling colors when stdout is an actual terminal.
-if [[ -t 1 ]]; then
-    readonly C_RESET=$'\033[0m'
-    readonly C_BOLD=$'\033[1m'
-    readonly C_DIM=$'\033[2m'
-    readonly C_RED=$'\033[31m'
-    readonly C_GREEN=$'\033[32m'
-    readonly C_YELLOW=$'\033[33m'
-    readonly C_BLUE=$'\033[34m'
-    readonly C_MAGENTA=$'\033[35m'
-    readonly C_CYAN=$'\033[36m'
-    readonly C_WHITE=$'\033[37m'
-else
-    readonly C_RESET="" C_BOLD="" C_DIM=""
-    readonly C_RED="" C_GREEN="" C_YELLOW=""
-    readonly C_BLUE="" C_MAGENTA="" C_CYAN="" C_WHITE=""
-fi
+# Mutable globals. Bash has no real notion of "private" state, so we keep
+# the list short and document each one instead of pretending otherwise.
+REPO_DIR=""           # set by load_app_settings
+THEME_NAME="default"  # set by load_app_settings
+DIRECTORIES=()        # set by load_tracked_paths
+FILES=()              # set by load_tracked_paths
+MENU_RESULT=""        # set by show_interactive_menu; read by its callers
+ORIGINAL_STTY=""      # saved terminal settings, for restore on exit
 
-readonly ICON_OK="✓"
-readonly ICON_ERR="✗"
-readonly ICON_WARN="⚠"
-readonly ICON_ARROW="→"
-readonly ICON_DIR="📁"
-readonly ICON_SYNC="🔄"
-readonly ICON_ROCKET="🚀"
-readonly ICON_GIT="🌿"
-readonly ICON_EDIT="📝"
-
-# ---------------------------------------------------------------------------
-# DEFAULT TRACKED PATHS
-# ---------------------------------------------------------------------------
-# These are only used to SEED the config file the very first time the
-# script runs. After that, everything is read from PATHS_CONFIG_FILE so
-# nothing is hardcoded in the logic below.
-DEFAULT_DIRECTORIES=(
+# Seed values for the tracked-paths config file. These are only ever used
+# once, the very first time the app runs and PATHS_CONFIG_FILE doesn't
+# exist yet. After that, the config file is the single source of truth —
+# nothing below this point should ever hardcode a dotfile path again.
+readonly -a DEFAULT_DIRECTORIES=(
     ".config/custom"
     ".config/hypr/custom"
     ".config/nvim"
     ".config/tmux"
 )
-
-DEFAULT_FILES=(
+readonly -a DEFAULT_FILES=(
     ".config/foot/foot.ini"
     ".config/fish/config.fish"
     ".config/kitty/kitty.conf"
 )
 
-# These will be populated by load_tracked_paths().
-DIRECTORIES=()
-FILES=()
+# Icons. These don't change with the theme — Unicode glyphs cost the same
+# number of bytes whether your terminal is pink or beige.
+readonly ICON_OK="✓"
+readonly ICON_ERR="✗"
+readonly ICON_WARN="⚠"
+readonly ICON_ARROW="→"
+readonly ICON_DIR="📁"
+readonly ICON_FILE="📄"
+readonly ICON_SYNC="🔄"
+readonly ICON_ROCKET="🚀"
 
-# ---------------------------------------------------------------------------
-# UI HELPER FUNCTIONS
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION 2: THEME
+# ============================================================================
+#
+# C_RESET/C_BOLD/C_DIM are terminal primitives, not "colors" — they stay
+# the same no matter which theme is active. C_ACCENT/C_GREEN/C_RED/
+# C_YELLOW/C_BLUE are the themeable palette, swapped out by apply_theme().
+if [[ -t 1 ]]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+else
+    # Not a terminal (piped to a file, redirected, etc). Degrade to plain
+    # text rather than filling a log file with escape-code soup.
+    C_RESET=""
+    C_BOLD=""
+    C_DIM=""
+fi
+C_ACCENT=""
+C_GREEN=""
+C_RED=""
+C_YELLOW=""
+C_BLUE=""
 
-# Return the terminal width, falling back to 80 columns if it can't be
-# determined (e.g. running in a non-interactive environment).
-term_width() {
-    local cols
-    cols=$(tput cols 2>/dev/null || echo 80)
-    echo "$cols"
+# Swap the themeable palette. Called once at startup, and again whenever
+# the user changes it from Settings > Theme.
+#
+# "default" is plain 8-color ANSI: it works literally everywhere, including
+# that one TTY without a GPU you SSH into at 3am to fix something on fire.
+#
+# "mocha" is Catppuccin Mocha, using 24-bit truecolor escapes. Almost every
+# terminal from the last decade supports it (foot and kitty certainly do).
+apply_theme() {
+    local theme="${1:-default}"
+
+    if [[ ! -t 1 ]]; then
+        C_ACCENT=""
+        C_GREEN=""
+        C_RED=""
+        C_YELLOW=""
+        C_BLUE=""
+        return 0
+    fi
+
+    case "$theme" in
+        mocha)
+            C_ACCENT=$'\033[38;2;203;166;247m' # Mauve
+            C_GREEN=$'\033[38;2;166;227;161m'  # Green
+            C_RED=$'\033[38;2;243;139;168m'    # Red
+            C_YELLOW=$'\033[38;2;249;226;175m' # Yellow
+            C_BLUE=$'\033[38;2;137;180;250m'   # Blue
+            ;;
+        *)
+            C_ACCENT=$'\033[36m'
+            C_GREEN=$'\033[32m'
+            C_RED=$'\033[31m'
+            C_YELLOW=$'\033[33m'
+            C_BLUE=$'\033[34m'
+            ;;
+    esac
+
+    return 0
 }
 
-# Print a line of a repeated character across the terminal width.
-# Usage: print_rule "="
+# ============================================================================
+# SECTION 3: UTILITY FUNCTIONS
+# ============================================================================
+
+# Terminal width, falling back to 80 columns if it can't be determined
+# (e.g. no controlling terminal). Used to draw rules and center titles.
+term_width() {
+    tput cols 2>/dev/null || echo 80
+}
+
+# Print a horizontal rule spanning the terminal width.
+# Usage: print_rule "─"
 print_rule() {
-    local char="${1:-=}"
+    local char="${1:--}"
     local width
     width=$(term_width)
     printf '%*s\n' "$width" '' | tr ' ' "$char"
 }
 
-# Print text centered within the terminal width.
-# Usage: print_centered "some text" "$C_BOLD"
+# Print text centered within the terminal width, in an optional color.
+# Usage: print_centered "some text" "$C_BOLD$C_ACCENT"
 print_centered() {
     local text="$1"
     local color="${2:-}"
-    local width
+    local width padding
     width=$(term_width)
-    local padding=$(( (width - ${#text}) / 2 ))
+    padding=$(( (width - ${#text}) / 2 ))
     (( padding < 0 )) && padding=0
     printf '%*s%s%s%s\n' "$padding" '' "$color" "$text" "$C_RESET"
 }
 
-# Print the application banner / title screen.
-print_banner() {
+# Replace a leading $HOME with ~, purely for display. Defined once so the
+# same shortening logic isn't retyped in a dozen different echo statements
+# (and so it's easy to change later if we ever want, say, full paths).
+shorten_path() {
+    printf '%s' "${1/#$HOME/~}"
+}
+
+# Standardized message helpers. Every screen in the app uses these instead
+# of ad-hoc `echo`, so the look-and-feel stays consistent by construction.
+print_success() { echo "  ${C_GREEN}${ICON_OK}${C_RESET} $1"; }
+print_error()   { echo "  ${C_RED}${ICON_ERR}${C_RESET} $1" >&2; }
+print_warning() { echo "  ${C_YELLOW}${ICON_WARN}${C_RESET} $1"; }
+print_info()    { echo "  ${C_BLUE}${ICON_ARROW}${C_RESET} $1"; }
+
+# Print a two-count-plus-errors summary block, shared by sync and restore
+# so the formatting logic exists in exactly one place.
+# Usage: print_summary "Sync summary" "Directories synced" "$n" "Files copied" "$m" "$errors"
+print_summary() {
+    local title="$1" label_a="$2" count_a="$3" label_b="$4" count_b="$5" errors="$6"
     echo
-    print_rule "="
-    print_centered "DOTFILES MANAGER" "${C_BOLD}${C_CYAN}"
-    print_rule "="
-    echo
-    echo "  ${C_DIM}Repository:${C_RESET}"
-    echo "  ${C_BOLD}${REPO_DIR/#$HOME/~}${C_RESET}"
-    echo
+    print_rule "─"
+    echo "  ${C_BOLD}${title}${C_RESET}"
+    echo "  ${label_a}: ${C_GREEN}${count_a}${C_RESET}"
+    echo "  ${label_b}: ${C_GREEN}${count_b}${C_RESET}"
+    if (( errors > 0 )); then
+        echo "  Errors: ${C_RED}${errors}${C_RESET}"
+    else
+        echo "  Errors: ${C_GREEN}${errors}${C_RESET}"
+    fi
+    print_rule "─"
 }
 
-# Standardized success message.
-# Usage: print_success "message"
-print_success() {
-    echo "  ${C_GREEN}${ICON_OK}${C_RESET} $1"
+# ============================================================================
+# SECTION 4: INPUT FUNCTIONS
+# ============================================================================
+#
+# There is exactly ONE function that reads a single keypress (read_key)
+# and exactly ONE function that reads a free-text line (prompt_line).
+# Every prompt, menu, and confirmation in this app is built on top of
+# these two — no scattered `read -p` calls reinventing the same thing
+# slightly differently in five places.
+
+# Put the terminal into "raw-ish" (cbreak) mode: keys are delivered to us
+# one at a time, immediately, without waiting for Enter, and without the
+# terminal echoing them back at us. This is what makes arrow-key/hjkl
+# navigation possible at all — canonical mode would buffer every keypress
+# until the user hits Enter, which is not the vibe we're going for.
+enter_raw_mode() {
+    ORIGINAL_STTY=$(stty -g 2>/dev/null) || true
+    stty -icanon -echo min 1 time 0 2>/dev/null || true
+    tput civis 2>/dev/null || true # hide the cursor while we're driving menus
 }
 
-# Standardized error message (printed to stderr).
-# Usage: print_error "message"
-print_error() {
-    echo "  ${C_RED}${ICON_ERR}${C_RESET} $1" >&2
+# Put the terminal back the way we found it. Called on every exit path —
+# normal quit, error, or Ctrl+C — because leaving someone's terminal
+# stuck in raw mode is the kind of thing that ruins an evening.
+restore_terminal_mode() {
+    if [[ -n "$ORIGINAL_STTY" ]]; then
+        stty "$ORIGINAL_STTY" 2>/dev/null || true
+    fi
+    tput cnorm 2>/dev/null || true
 }
 
-# Standardized warning message.
-# Usage: print_warning "message"
-print_warning() {
-    echo "  ${C_YELLOW}${ICON_WARN}${C_RESET} $1"
+# Read exactly one logical keypress and classify it. Returns one of:
+#   UP DOWN LEFT RIGHT ENTER ESCAPE  or  KEY:<char> for anything else.
+#
+# Arrow keys don't send a single byte — they send an escape sequence
+# (ESC, then '[', then a letter), a convention terminals have followed
+# since the VT100. We read the ESC, then race a very short timeout
+# against a second read: if two more bytes show up almost instantly,
+# it was an arrow key; if nothing follows, it was just a lonely Esc.
+read_key() {
+    local key seq
+    IFS= read -rsn1 key || true
+
+    case "$key" in
+        $'\x1b')
+            seq=""
+            if IFS= read -rsn2 -t 0.01 seq 2>/dev/null; then
+                case "$seq" in
+                    '[A') echo "UP" ;;
+                    '[B') echo "DOWN" ;;
+                    '[C') echo "RIGHT" ;;
+                    '[D') echo "LEFT" ;;
+                    *)    echo "ESCAPE" ;;
+                esac
+            else
+                # Escape always means go back. Just like Vim. Except
+                # without the mild existential dread of wondering whether
+                # you'll ever actually leave.
+                echo "ESCAPE"
+            fi
+            ;;
+        $'\r' | $'\n' | '')
+            echo "ENTER"
+            ;;
+        *)
+            echo "KEY:$key"
+            ;;
+    esac
+
+    return 0
 }
 
-# Standardized informational / progress message.
-# Usage: print_info "message"
-print_info() {
-    echo "  ${C_BLUE}${ICON_ARROW}${C_RESET} $1"
+# Read one line of free text (commit messages, paths, etc). Temporarily
+# hands the terminal back to normal cooked mode with the cursor visible,
+# since that's what a person typing a sentence actually wants.
+prompt_line() {
+    local prompt="$1" input=""
+    tput cnorm 2>/dev/null || true
+    stty icanon echo 2>/dev/null || true
+    read -r -p "  ${prompt}" input || true
+    stty -icanon -echo min 1 time 0 2>/dev/null || true
+    tput civis 2>/dev/null || true
+    printf '%s' "$input"
 }
 
-# Print a section heading, e.g. "── Syncing directories ──"
-print_section() {
-    echo
-    echo "${C_MAGENTA}${C_BOLD}── $1 ──${C_RESET}"
-}
-
-# Ask the user a yes/no question. Returns 0 for yes, 1 for no.
-# Defaults to "no" if the user just presses Enter, since this is used
-# to guard destructive operations.
+# Yes/no confirmation, built on read_key so there's no second copy of the
+# "read a key from the user" logic anywhere in this file. Defaults to
+# "no" on anything but an explicit y/Y, since this guards destructive
+# operations (restore, checkout) where the safe default matters more
+# than saving a keystroke.
 # Usage: if confirm "Are you sure?"; then ... fi
 confirm() {
-    local prompt="$1"
-    local reply
-    read -r -p "  ${C_YELLOW}${ICON_WARN}${C_RESET} ${prompt} [y/N] " reply
-    case "$reply" in
-        [yY]|[yY][eE][sS]) return 0 ;;
-        *) return 1 ;;
-    esac
+    local prompt="$1" key
+    printf '  %s%s%s %s %s[y/N]%s ' "$C_YELLOW" "$ICON_WARN" "$C_RESET" "$prompt" "$C_DIM" "$C_RESET"
+    while true; do
+        key=$(read_key)
+        case "$key" in
+            KEY:y | KEY:Y) echo; return 0 ;;
+            KEY:n | KEY:N | ENTER | ESCAPE) echo; return 1 ;;
+            *) : ;; # anything else: keep waiting, don't guess
+        esac
+    done
 }
 
-# Pause and wait for the user to press Enter before redrawing the menu.
-# This gives the user time to read the output of the previous operation.
-press_enter_to_continue() {
+# Wait for any keypress before redrawing whatever comes next. Gives the
+# user a moment to actually read the output of the action they just ran.
+pause_for_return() {
     echo
-    read -r -p "  ${C_DIM}Press Enter to return to the menu...${C_RESET}"
+    printf '  %sPress any key to continue...%s' "$C_DIM" "$C_RESET"
+    read_key >/dev/null
+    echo
 }
 
-# ---------------------------------------------------------------------------
-# CONFIGURATION LOADING
-# ---------------------------------------------------------------------------
-
-# Create the app config directory + default paths config file if they
-# don't exist yet. This runs once, on first launch.
-ensure_config_exists() {
-    if [[ ! -d "$APP_CONFIG_DIR" ]]; then
-        mkdir -p "$APP_CONFIG_DIR"
-    fi
-
-    if [[ ! -f "$PATHS_CONFIG_FILE" ]]; then
-        {
-            echo "# dotfiles-manager tracked paths"
-            echo "#"
-            echo "# DIRECTORIES: paths to directories (relative to \$HOME) that will be"
-            echo "#              synced/restored recursively with rsync."
-            echo "# FILES:       paths to individual files (relative to \$HOME) that will"
-            echo "#              be synced/restored with cp."
-            echo "#"
-            echo "# Edit this file directly, or use option 9 in the dotfiles menu."
-            echo
-            echo "DIRECTORIES=("
-            for d in "${DEFAULT_DIRECTORIES[@]}"; do
-                echo "    \"$d\""
-            done
-            echo ")"
-            echo
-            echo "FILES=("
-            for f in "${DEFAULT_FILES[@]}"; do
-                echo "    \"$f\""
-            done
-            echo ")"
-        } > "$PATHS_CONFIG_FILE"
-    fi
+# Run an external, full-screen program (an editor, basically) with the
+# terminal restored to normal mode, then put our raw mode back afterward.
+# Without this, launching nvim while we're sitting in -icanon/-echo with
+# the cursor hidden would make for a very confusing few seconds.
+run_external_program() {
+    restore_terminal_mode
+    local status=0
+    "$@" || status=$?
+    enter_raw_mode
+    return "$status"
 }
 
-# Source the paths config file to populate DIRECTORIES and FILES.
+# Find the best available editor. Preference order: the user's own
+# $EDITOR/$VISUAL, then a fallback chain from "full-featured" to
+# "definitely installed everywhere." Centralized here so nothing else
+# in this file hardcodes an editor name.
+resolve_editor() {
+    local candidate
+    for candidate in "${EDITOR:-}" "${VISUAL:-}" nvim vim micro nano; do
+        [[ -z "$candidate" ]] && continue
+        if command -v "$candidate" >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ============================================================================
+# SECTION 5: UI FUNCTIONS
+# ============================================================================
+
+# Draw a screen header: a title bar with an optional breadcrumb, used by
+# both full menus and one-shot action screens so they share a look.
+draw_screen_header() {
+    local title="$1"
+    clear
+    print_rule "─"
+    print_centered "$title" "${C_BOLD}${C_ACCENT}"
+    print_rule "─"
+    echo
+}
+
+# Start a one-shot action screen (git status, a diff, sync output, etc).
+# Just a thin, readable name for draw_screen_header at call sites that
+# aren't menus — same header, different intent.
+begin_action_screen() {
+    draw_screen_header "$1"
+}
+
+# Repository summary block shown under the title on the main menu:
+# path, current branch, clean/dirty, and how many paths are tracked.
+# Nothing here is fatal if the repo doesn't exist yet — the point of
+# this block is partly to make that obvious at a glance.
+print_status_block() {
+    local branch status_label status_color
+
+    branch=$(current_branch)
+
+    if is_repo_clean; then
+        status_label="Clean"
+        status_color="$C_GREEN"
+    else
+        status_label="Dirty"
+        status_color="$C_YELLOW"
+    fi
+
+    echo "  ${C_DIM}Repository${C_RESET}"
+    if repo_is_valid; then
+        echo "  ${C_GREEN}${ICON_OK}${C_RESET} $(shorten_path "$REPO_DIR")"
+    else
+        echo "  ${C_RED}${ICON_ERR}${C_RESET} $(shorten_path "$REPO_DIR") ${C_DIM}(not found)${C_RESET}"
+    fi
+    echo
+    echo "  ${C_DIM}Branch${C_RESET}"
+    echo "  ${branch}"
+    echo
+    echo "  ${C_DIM}Status${C_RESET}"
+    echo "  ${status_color}${status_label}${C_RESET}"
+    echo
+    echo "  ${C_DIM}Tracked${C_RESET}"
+    echo "  ${#DIRECTORIES[@]} folders"
+    echo "  ${#FILES[@]} files"
+}
+
+# Render one full menu screen: header, optional status block, the item
+# list with the current selection highlighted, and a footer key legend.
+# This is pure rendering — no input handling lives here.
+render_menu_screen() {
+    local title="$1" show_status="$2" selected="$3"
+    shift 3
+    local -a items=("$@")
+
+    draw_screen_header "$title"
+
+    if [[ "$show_status" == "1" ]]; then
+        print_status_block
+        echo
+    fi
+
+    local i=0 item
+    for item in "${items[@]}"; do
+        if (( i == selected )); then
+            printf '  %s%s❯ %s%s\n' "$C_ACCENT" "$C_BOLD" "$item" "$C_RESET"
+        else
+            printf '    %s%s%s\n' "$C_DIM" "$item" "$C_RESET"
+        fi
+        (( ++i ))
+    done
+
+    echo
+    print_rule "─"
+    printf '  %s↑↓/jk%s Move   %sEnter%s Select   %sEsc%s Back   %sq%s Quit   %s?%s Help\n' \
+        "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+}
+
+# The single, reusable interactive menu. Every menu in this app — main,
+# Git, Tracked Files, Settings, Theme, Branches — calls this instead of
+# hand-rolling its own selection loop.
+#
+# Sets the global MENU_RESULT to one of:
+#   an integer index into the items you passed in, or
+#   "BACK" (Esc / h)
+#   '?' (help) is handled internally and never leaks out — it shows the
+#     help screen and simply redraws this same menu afterward.
+#   'q' exits the whole application immediately and never returns here.
+#
+# Usage: show_interactive_menu "Title" <show_status 0|1> "Item one" "Item two" ...
+show_interactive_menu() {
+    local title="$1" show_status="$2"
+    shift 2
+    local -a items=("$@")
+    local count=${#items[@]}
+    local selected=0
+    local key
+
+    while true; do
+        render_menu_screen "$title" "$show_status" "$selected" "${items[@]}"
+        key=$(read_key)
+
+        case "$key" in
+            UP | KEY:k)
+                selected=$(( (selected - 1 + count) % count ))
+                ;;
+            DOWN | KEY:j)
+                selected=$(( (selected + 1) % count ))
+                ;;
+            ENTER)
+                MENU_RESULT="$selected"
+                return 0
+                ;;
+            ESCAPE | KEY:h)
+                MENU_RESULT="BACK"
+                return 0
+                ;;
+            KEY:q)
+                cleanup_and_exit 0
+                ;;
+            'KEY:?')
+                show_help_screen
+                ;;
+            *)
+                : # ignore anything we don't recognize and keep waiting
+                ;;
+        esac
+    done
+}
+
+# The help screen, reachable with '?' from literally any menu. It's a
+# dead end by design: read, absorb, press a key, go back to whatever you
+# were doing. No navigation logic needed beyond that.
+show_help_screen() {
+    draw_screen_header "Help"
+
+    echo "  ${C_BOLD}Navigation${C_RESET}"
+    echo "    ↑ / k        Move selection up"
+    echo "    ↓ / j        Move selection down"
+    echo "    Enter        Select the highlighted item"
+    echo "    Esc / h      Go back one menu"
+    echo "    q            Quit the application, from anywhere"
+    echo "    ?            Show this help screen"
+    echo
+    echo "  ${C_BOLD}What this tool does${C_RESET}"
+    echo "    Sync copies tracked files FROM \$HOME INTO the git repository."
+    echo "    Restore copies them the other way — repository back to \$HOME."
+    echo "    Everything else is just Git, pointed at that repository."
+    echo
+    print_rule "─"
+    pause_for_return
+}
+
+# ============================================================================
+# SECTION 6: CONFIGURATION
+# ============================================================================
+
+# Create the tracked-paths config file with sensible defaults the first
+# time the app runs. If you think you'll remember, six months from now,
+# which fifteen directories you actually cared about — you won't. That's
+# what this file is for.
+ensure_paths_config_exists() {
+    mkdir -p "$APP_CONFIG_DIR"
+
+    if [[ -f "$PATHS_CONFIG_FILE" ]]; then
+        return 0
+    fi
+
+    {
+        echo "# dotfiles-manager — tracked paths"
+        echo "#"
+        echo "# DIRECTORIES: paths (relative to \$HOME) synced/restored recursively"
+        echo "#              with rsync."
+        echo "# FILES:       individual paths (relative to \$HOME) synced/restored"
+        echo "#              with cp."
+        echo "#"
+        echo "# Edit this file directly, or use Tracked Files > Edit tracked paths."
+        echo
+        echo "DIRECTORIES=("
+        local d
+        for d in "${DEFAULT_DIRECTORIES[@]}"; do
+            echo "    \"$d\""
+        done
+        echo ")"
+        echo
+        echo "FILES=("
+        local f
+        for f in "${DEFAULT_FILES[@]}"; do
+            echo "    \"$f\""
+        done
+        echo ")"
+    } > "$PATHS_CONFIG_FILE"
+
+    return 0
+}
+
+# Source the tracked-paths file to (re)populate DIRECTORIES and FILES.
 load_tracked_paths() {
-    ensure_config_exists
-
+    ensure_paths_config_exists
     # shellcheck source=/dev/null
     source "$PATHS_CONFIG_FILE"
+    return 0
 }
 
-# ---------------------------------------------------------------------------
-# REPO SANITY CHECK
-# ---------------------------------------------------------------------------
+# Load app-level settings (repository path, theme) with sensible defaults,
+# then let a saved settings file override them, then let an explicit
+# environment variable override THAT — env vars win, for scripting.
+load_app_settings() {
+    REPO_DIR="$HOME/dots"
+    THEME_NAME="default"
 
-# Make sure the dotfiles repository actually exists and is a git repo
-# before we try to do anything with it.
-ensure_repo_exists() {
-    if [[ ! -d "$REPO_DIR" ]]; then
-        print_error "Repository not found at: ${REPO_DIR/#$HOME/~}"
-        print_info "Create it first, e.g.: mkdir -p ${REPO_DIR} && git -C ${REPO_DIR} init"
-        return 1
+    mkdir -p "$APP_CONFIG_DIR"
+    if [[ -f "$APP_SETTINGS_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$APP_SETTINGS_FILE"
     fi
 
-    if [[ ! -d "$REPO_DIR/.git" ]]; then
-        print_error "${REPO_DIR/#$HOME/~} exists but is not a git repository."
-        print_info "Run: git -C ${REPO_DIR} init"
-        return 1
+    if [[ -n "${DOTFILES_REPO:-}" ]]; then
+        REPO_DIR="$DOTFILES_REPO"
     fi
 
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# SYNC: system ($HOME) -> repository (~/dots)
-# ---------------------------------------------------------------------------
-sync_dotfiles() {
-    print_section "${ICON_SYNC} Sync: system → repository"
+# Persist the current REPO_DIR / THEME_NAME so they survive a restart.
+save_app_settings() {
+    mkdir -p "$APP_CONFIG_DIR"
+    {
+        echo "# dotfiles-manager — application settings"
+        echo "# Generated automatically. Feel free to hand-edit."
+        echo "REPO_DIR=\"$REPO_DIR\""
+        echo "THEME_NAME=\"$THEME_NAME\""
+    } > "$APP_SETTINGS_FILE"
+    return 0
+}
 
-    if ! ensure_repo_exists; then
-        return 1
+# ============================================================================
+# SECTION 7: REPOSITORY LOGIC
+# ============================================================================
+
+# Silent check: does the repository exist and is it actually a git repo?
+# Used anywhere we just need a boolean, without printing anything.
+repo_is_valid() {
+    [[ -d "$REPO_DIR" && -d "$REPO_DIR/.git" ]]
+}
+
+# Loud check: same as above, but explains itself when it fails. Every
+# action that touches the repo calls this first.
+# Usage: if ! require_repo; then pause_for_return; return; fi
+require_repo() {
+    if repo_is_valid; then
+        return 0
     fi
 
-    local dirs_synced=0
-    local files_copied=0
-    local errors=0
+    print_error "Repository not found at $(shorten_path "$REPO_DIR")"
+    print_info "Create it with: mkdir -p ${REPO_DIR} && git -C ${REPO_DIR} init"
+    return 1
+}
 
-    # --- Directories -------------------------------------------------------
+# Current branch name, or "-" if there isn't a valid repo (or no commits
+# yet). Deliberately never fails outright — it's used in a lot of places
+# that just want something to print.
+current_branch() {
+    if repo_is_valid; then
+        git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "-"
+    else
+        echo "-"
+    fi
+}
+
+# Is the working tree clean (no staged or unstaged changes)? Git
+# remembers everything — unlike me before coffee — so this is exact.
+is_repo_clean() {
+    if ! repo_is_valid; then
+        return 1
+    fi
+    local dirty
+    dirty=$(git -C "$REPO_DIR" status --porcelain 2>/dev/null) || true
+    [[ -z "$dirty" ]]
+}
+
+# ============================================================================
+# SECTION 8: SYNC LOGIC ($HOME -> repository)
+# ============================================================================
+
+action_sync() {
+    begin_action_screen "Sync: system → repository"
+
+    if ! require_repo; then
+        pause_for_return
+        return
+    fi
+
+    local dirs_synced=0 files_copied=0 errors=0
+    local rel_path src dest
+
     if (( ${#DIRECTORIES[@]} > 0 )); then
-        echo
-        print_info "Syncing directories..."
+        echo "  ${C_BOLD}Directories${C_RESET}"
         for rel_path in "${DIRECTORIES[@]}"; do
-            local src="$HOME/$rel_path"
-            local dest="$REPO_DIR/$rel_path"
+            src="$HOME/$rel_path"
+            dest="$REPO_DIR/$rel_path"
 
             if [[ ! -d "$src" ]]; then
                 print_warning "Skipped (missing): ~/$rel_path"
@@ -283,88 +664,80 @@ sync_dotfiles() {
 
             mkdir -p "$dest"
 
-            # -a  archive mode (preserves permissions, symlinks, timestamps)
-            # -r  recursive
-            # --delete keeps the repo copy an exact mirror of the source
+            # --delete makes the repo copy an exact mirror of $HOME: if you
+            # remove something locally and sync, it disappears from the
+            # repo too. That's the intended behavior, not a bug — but it's
+            # also exactly the kind of flag you want to understand before
+            # you trust it. Read your diffs before you push. Trust, verify.
             if rsync -a --delete "$src"/ "$dest"/; then
                 print_success "${ICON_DIR} ~/$rel_path"
                 (( ++dirs_synced ))
             else
-                print_error "Failed to sync: ~/$rel_path"
+                print_error "Failed to sync ~/$rel_path"
                 (( ++errors ))
             fi
         done
+        echo
     fi
 
-    # --- Individual files ----------------------------------------------------
     if (( ${#FILES[@]} > 0 )); then
-        echo
-        print_info "Syncing files..."
+        echo "  ${C_BOLD}Files${C_RESET}"
         for rel_path in "${FILES[@]}"; do
-            local src="$HOME/$rel_path"
-            local dest="$REPO_DIR/$rel_path"
+            src="$HOME/$rel_path"
+            dest="$REPO_DIR/$rel_path"
 
             if [[ ! -f "$src" ]]; then
                 print_warning "Skipped (missing): ~/$rel_path"
                 continue
             fi
 
-            # Ensure the destination's parent directory exists first.
             mkdir -p "$(dirname "$dest")"
 
             if cp -f "$src" "$dest"; then
-                print_success "$rel_path"
+                print_success "${ICON_FILE} ~/$rel_path"
                 (( ++files_copied ))
             else
-                print_error "Failed to copy: ~/$rel_path"
+                print_error "Failed to copy ~/$rel_path"
                 (( ++errors ))
             fi
         done
+        echo
     fi
 
-    # --- Summary -------------------------------------------------------------
-    echo
-    print_rule "-"
-    echo "  ${C_BOLD}Sync summary${C_RESET}"
-    echo "  Directories synced: ${C_GREEN}${dirs_synced}${C_RESET}"
-    echo "  Files copied:       ${C_GREEN}${files_copied}${C_RESET}"
-    if (( errors > 0 )); then
-        echo "  Errors:             ${C_RED}${errors}${C_RESET}"
-    else
-        echo "  Errors:             ${C_GREEN}${errors}${C_RESET}"
-    fi
-    print_rule "-"
+    print_summary "Sync summary" "Directories synced" "$dirs_synced" "Files copied" "$files_copied" "$errors"
+    pause_for_return
 }
 
-# ---------------------------------------------------------------------------
-# RESTORE: repository (~/dots) -> system ($HOME)
-# ---------------------------------------------------------------------------
-restore_dotfiles() {
-    print_section "${ICON_ROCKET} Restore: repository → system"
+# ============================================================================
+# SECTION 9: RESTORE LOGIC (repository -> $HOME)
+# ============================================================================
 
-    if ! ensure_repo_exists; then
-        return 1
+action_restore() {
+    begin_action_screen "Restore: repository → system"
+
+    if ! require_repo; then
+        pause_for_return
+        return
     fi
 
-    print_warning "This will OVERWRITE files in your \$HOME with the versions"
-    print_warning "currently stored in ${REPO_DIR/#$HOME/~}."
+    print_warning "This will OVERWRITE files in \$HOME with the versions"
+    print_warning "currently stored in $(shorten_path "$REPO_DIR")."
     echo
     if ! confirm "Continue with restore?"; then
         print_info "Restore cancelled."
-        return 0
+        pause_for_return
+        return
     fi
+    echo
 
-    local dirs_restored=0
-    local files_restored=0
-    local errors=0
+    local dirs_restored=0 files_restored=0 errors=0
+    local rel_path src dest
 
-    # --- Directories -------------------------------------------------------
     if (( ${#DIRECTORIES[@]} > 0 )); then
-        echo
-        print_info "Restoring directories..."
+        echo "  ${C_BOLD}Directories${C_RESET}"
         for rel_path in "${DIRECTORIES[@]}"; do
-            local src="$REPO_DIR/$rel_path"
-            local dest="$HOME/$rel_path"
+            src="$REPO_DIR/$rel_path"
+            dest="$HOME/$rel_path"
 
             if [[ ! -d "$src" ]]; then
                 print_warning "Skipped (not in repo): $rel_path"
@@ -377,19 +750,18 @@ restore_dotfiles() {
                 print_success "${ICON_DIR} ~/$rel_path"
                 (( ++dirs_restored ))
             else
-                print_error "Failed to restore: ~/$rel_path"
+                print_error "Failed to restore ~/$rel_path"
                 (( ++errors ))
             fi
         done
+        echo
     fi
 
-    # --- Individual files ----------------------------------------------------
     if (( ${#FILES[@]} > 0 )); then
-        echo
-        print_info "Restoring files..."
+        echo "  ${C_BOLD}Files${C_RESET}"
         for rel_path in "${FILES[@]}"; do
-            local src="$REPO_DIR/$rel_path"
-            local dest="$HOME/$rel_path"
+            src="$REPO_DIR/$rel_path"
+            dest="$HOME/$rel_path"
 
             if [[ ! -f "$src" ]]; then
                 print_warning "Skipped (not in repo): $rel_path"
@@ -399,218 +771,490 @@ restore_dotfiles() {
             mkdir -p "$(dirname "$dest")"
 
             if cp -f "$src" "$dest"; then
-                print_success "~/$rel_path"
+                print_success "${ICON_FILE} ~/$rel_path"
                 (( ++files_restored ))
             else
-                print_error "Failed to restore: ~/$rel_path"
+                print_error "Failed to restore ~/$rel_path"
                 (( ++errors ))
             fi
         done
+        echo
     fi
 
-    # --- Summary -------------------------------------------------------------
-    echo
-    print_rule "-"
-    echo "  ${C_BOLD}Restore summary${C_RESET}"
-    echo "  Directories restored: ${C_GREEN}${dirs_restored}${C_RESET}"
-    echo "  Files restored:       ${C_GREEN}${files_restored}${C_RESET}"
-    if (( errors > 0 )); then
-        echo "  Errors:               ${C_RED}${errors}${C_RESET}"
-    else
-        echo "  Errors:               ${C_GREEN}${errors}${C_RESET}"
-    fi
-    print_rule "-"
+    print_summary "Restore summary" "Directories restored" "$dirs_restored" "Files restored" "$files_restored" "$errors"
+    pause_for_return
 }
 
-# ---------------------------------------------------------------------------
-# GIT OPERATIONS
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION 10: GIT LOGIC
+# ============================================================================
 
 git_status() {
-    print_section "${ICON_GIT} Git status"
-    ensure_repo_exists || return 1
+    begin_action_screen "Git › Status"
+    if ! require_repo; then
+        pause_for_return
+        return
+    fi
     git -C "$REPO_DIR" status
+    pause_for_return
 }
 
-git_diff() {
-    print_section "${ICON_GIT} Git diff"
-    ensure_repo_exists || return 1
+git_diff_unstaged() {
+    begin_action_screen "Git › Diff (unstaged)"
+    if ! require_repo; then
+        pause_for_return
+        return
+    fi
     git -C "$REPO_DIR" diff
+    pause_for_return
+}
+
+git_diff_staged() {
+    begin_action_screen "Git › Diff (staged)"
+    if ! require_repo; then
+        pause_for_return
+        return
+    fi
+    git -C "$REPO_DIR" diff --cached
+    pause_for_return
 }
 
 git_commit() {
-    print_section "${ICON_GIT} Git commit"
-    ensure_repo_exists || return 1
-
-    local message
-    read -r -p "  Commit message: " message
-
-    if [[ -z "$message" ]]; then
-        print_warning "Empty commit message, cancelling."
-        return 0
+    begin_action_screen "Git › Commit"
+    if ! require_repo; then
+        pause_for_return
+        return
     fi
 
-    # Stage everything tracked/untracked under the repo, then commit.
-    git -C "$REPO_DIR" add -A
+    local message
+    message=$(prompt_line "Commit message: ")
 
-    # If there's nothing staged, `git commit` would fail and (with set -e)
-    # abort the script, so we check for that explicitly first.
+    if [[ -z "$message" ]]; then
+        print_warning "Empty commit message — cancelling."
+        pause_for_return
+        return
+    fi
+
+    if ! git -C "$REPO_DIR" add -A; then
+        print_error "Failed to stage changes."
+        pause_for_return
+        return
+    fi
+
+    # Checking for "nothing staged" ourselves, instead of letting `git
+    # commit` fail, avoids a very abrupt way to learn your tree was
+    # already clean. This function has one job: commit. If it starts
+    # doing more, congratulations, you've invented technical debt.
     if git -C "$REPO_DIR" diff --cached --quiet; then
         print_warning "Nothing to commit — working tree is clean."
-        return 0
+        pause_for_return
+        return
     fi
 
     if git -C "$REPO_DIR" commit -m "$message"; then
-        print_success "Committed: \"$message\""
+        print_success "Committed: \"${message}\""
     else
         print_error "Commit failed."
-        return 1
     fi
-}
-
-# Resolve the current branch name of the repo. Used by push/pull.
-current_branch() {
-    git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD
+    pause_for_return
 }
 
 git_push() {
-    print_section "${ICON_GIT} Git push"
-    ensure_repo_exists || return 1
+    begin_action_screen "Git › Push"
+    if ! require_repo; then
+        pause_for_return
+        return
+    fi
 
     local branch
     branch=$(current_branch)
-    print_info "Pushing branch '${branch}' to origin..."
+    print_info "Pushing '${branch}' to origin..."
 
     if git -C "$REPO_DIR" push origin "$branch"; then
         print_success "Pushed '${branch}' to origin."
     else
-        print_error "Push failed."
-        return 1
+        print_error "Push failed — check your remote and network connection."
     fi
+    pause_for_return
 }
 
 git_pull() {
-    print_section "${ICON_GIT} Git pull"
-    ensure_repo_exists || return 1
+    begin_action_screen "Git › Pull"
+    if ! require_repo; then
+        pause_for_return
+        return
+    fi
 
     local branch
     branch=$(current_branch)
-    print_info "Pulling branch '${branch}' from origin..."
+    print_info "Pulling '${branch}' from origin..."
 
     if git -C "$REPO_DIR" pull origin "$branch"; then
         print_success "Pulled latest changes for '${branch}'."
     else
-        print_error "Pull failed."
-        return 1
+        print_error "Pull failed — you may have local changes in the way."
     fi
+    pause_for_return
 }
 
-# ---------------------------------------------------------------------------
-# TRACKED PATHS: view & edit
-# ---------------------------------------------------------------------------
+git_history() {
+    begin_action_screen "Git › History"
+    if ! require_repo; then
+        pause_for_return
+        return
+    fi
 
-show_tracked_paths() {
-    print_section "${ICON_DIR} Tracked paths"
+    if ! git -C "$REPO_DIR" log --oneline --graph --decorate --color=always -n 20; then
+        print_warning "No commits yet — this repository's story hasn't started."
+    fi
+    pause_for_return
+}
 
-    echo "  ${C_BOLD}Directories:${C_RESET}"
+# Interactive branch list: pick one to check out, or go Back. This is its
+# own little menu loop (not a single action), so it manages its own
+# pausing per selection rather than relying on its caller.
+git_branches_menu() {
+    if ! repo_is_valid; then
+        begin_action_screen "Git › Branches"
+        require_repo
+        pause_for_return
+        return
+    fi
+
+    while true; do
+        local current
+        current=$(current_branch)
+
+        local -a branch_names=()
+        mapfile -t branch_names < <(git -C "$REPO_DIR" branch --format='%(refname:short)' 2>/dev/null) || true
+
+        local -a labels=()
+        local b
+        for b in "${branch_names[@]}"; do
+            if [[ "$b" == "$current" ]]; then
+                labels+=("${b} (current)")
+            else
+                labels+=("$b")
+            fi
+        done
+        labels+=("Back")
+
+        show_interactive_menu "Git › Branches" 0 "${labels[@]}"
+
+        local last_index=$(( ${#labels[@]} - 1 ))
+        if [[ "$MENU_RESULT" == "BACK" || "$MENU_RESULT" == "$last_index" ]]; then
+            return
+        fi
+
+        local target="${branch_names[$MENU_RESULT]}"
+        begin_action_screen "Git › Branches"
+        if [[ "$target" == "$current" ]]; then
+            print_info "Already on '${target}'."
+        elif confirm "Checkout branch '${target}'?"; then
+            if git -C "$REPO_DIR" checkout "$target"; then
+                print_success "Switched to '${target}'."
+            else
+                print_error "Checkout failed — you may have uncommitted changes in the way."
+            fi
+        else
+            print_info "Cancelled."
+        fi
+        pause_for_return
+    done
+}
+
+# ============================================================================
+# SECTION 11: MENUS
+# ============================================================================
+
+# --- Tracked Files -----------------------------------------------------------
+
+view_tracked_paths() {
+    begin_action_screen "Tracked Files › View"
+
+    echo "  ${C_BOLD}Directories${C_RESET}"
     if (( ${#DIRECTORIES[@]} == 0 )); then
         echo "    ${C_DIM}(none)${C_RESET}"
     else
+        local d
         for d in "${DIRECTORIES[@]}"; do
             echo "    ${ICON_DIR} ~/$d"
         done
     fi
 
     echo
-    echo "  ${C_BOLD}Files:${C_RESET}"
+    echo "  ${C_BOLD}Files${C_RESET}"
     if (( ${#FILES[@]} == 0 )); then
         echo "    ${C_DIM}(none)${C_RESET}"
     else
+        local f
         for f in "${FILES[@]}"; do
-            echo "    📄 ~/$f"
+            echo "    ${ICON_FILE} ~/$f"
         done
     fi
 
     echo
-    print_info "Config file: ${PATHS_CONFIG_FILE/#$HOME/~}"
+    print_info "Config file: $(shorten_path "$PATHS_CONFIG_FILE")"
+    pause_for_return
 }
 
 edit_tracked_paths() {
-    print_section "${ICON_EDIT} Edit tracked paths"
+    begin_action_screen "Tracked Files › Edit"
+    ensure_paths_config_exists
 
-    ensure_config_exists
+    local editor
+    if ! editor=$(resolve_editor); then
+        print_error "No editor found. Set \$EDITOR, or install nvim/vim/micro/nano."
+        pause_for_return
+        return
+    fi
 
-    # Respect the user's preferred editor, falling back sensibly.
-    local editor="${EDITOR:-${VISUAL:-nano}}"
+    print_info "Opening $(shorten_path "$PATHS_CONFIG_FILE") with '${editor}'..."
+    run_external_program "$editor" "$PATHS_CONFIG_FILE"
 
-    print_info "Opening ${PATHS_CONFIG_FILE/#$HOME/~} with '${editor}'..."
-    "$editor" "$PATHS_CONFIG_FILE"
-
-    # Reload so the running session immediately reflects the changes.
     load_tracked_paths
     print_success "Tracked paths reloaded."
+    pause_for_return
 }
 
-# ---------------------------------------------------------------------------
-# MAIN MENU
-# ---------------------------------------------------------------------------
-
-show_menu() {
-    print_banner
-    echo "  Choose an option:"
-    echo
-    echo "  ${C_CYAN}1)${C_RESET} Sync system → repository"
-    echo "  ${C_CYAN}2)${C_RESET} Restore repository → system"
-    echo "  ${C_CYAN}3)${C_RESET} Git status"
-    echo "  ${C_CYAN}4)${C_RESET} Git diff"
-    echo "  ${C_CYAN}5)${C_RESET} Git commit"
-    echo "  ${C_CYAN}6)${C_RESET} Git push"
-    echo "  ${C_CYAN}7)${C_RESET} Git pull"
-    echo "  ${C_CYAN}8)${C_RESET} Show tracked paths"
-    echo "  ${C_CYAN}9)${C_RESET} Edit tracked paths"
-    echo "  ${C_CYAN}0)${C_RESET} Exit"
-    echo
-}
-
-# ---------------------------------------------------------------------------
-# ENTRY POINT
-# ---------------------------------------------------------------------------
-
-main() {
+reload_tracked_paths() {
+    begin_action_screen "Tracked Files › Reload"
     load_tracked_paths
+    print_success "Configuration reloaded from $(shorten_path "$PATHS_CONFIG_FILE")"
+    pause_for_return
+}
 
-    local choice
+tracked_files_menu() {
     while true; do
-        show_menu
-        read -r -p "  ${C_BOLD}❯${C_RESET} " choice
-        echo
+        show_interactive_menu "Tracked Files" 0 \
+            "View tracked paths" \
+            "Edit tracked paths" \
+            "Reload configuration" \
+            "Back"
 
-        case "$choice" in
-            1) sync_dotfiles ;;
-            2) restore_dotfiles ;;
-            3) git_status ;;
-            4) git_diff ;;
-            5) git_commit ;;
-            6) git_push ;;
-            7) git_pull ;;
-            8) show_tracked_paths ;;
-            9) edit_tracked_paths ;;
-            0)
-                echo "  ${C_DIM}Goodbye.${C_RESET}"
-                exit 0
-                ;;
-            *)
-                print_error "Invalid option: '$choice'"
-                ;;
+        case "$MENU_RESULT" in
+            0) view_tracked_paths ;;
+            1) edit_tracked_paths ;;
+            2) reload_tracked_paths ;;
+            3 | BACK) return ;;
         esac
-
-        press_enter_to_continue
     done
 }
 
-# Only run main if this script is executed directly (not sourced).
-# This makes it possible to source the script for testing individual
-# functions without kicking off the interactive menu.
+# --- Git ----------------------------------------------------------------------
+
+git_menu() {
+    while true; do
+        show_interactive_menu "Git" 0 \
+            "Status" \
+            "Diff (unstaged)" \
+            "Diff (staged)" \
+            "Commit" \
+            "Push" \
+            "Pull" \
+            "History" \
+            "Branches" \
+            "Back"
+
+        case "$MENU_RESULT" in
+            0) git_status ;;
+            1) git_diff_unstaged ;;
+            2) git_diff_staged ;;
+            3) git_commit ;;
+            4) git_push ;;
+            5) git_pull ;;
+            6) git_history ;;
+            7) git_branches_menu ;;
+            8 | BACK) return ;;
+        esac
+    done
+}
+
+# --- Settings -------------------------------------------------------------------
+
+settings_repository_path() {
+    begin_action_screen "Settings › Repository path"
+    echo "  Current: $(shorten_path "$REPO_DIR")"
+    echo
+
+    if confirm "Change the repository path?"; then
+        local new_path
+        new_path=$(prompt_line "New path (e.g. ~/dots): ")
+        new_path="${new_path/#\~/$HOME}" # bash won't expand a literal ~ for us here
+
+        if [[ -z "$new_path" ]]; then
+            print_warning "No path entered — keeping the current one."
+        else
+            REPO_DIR="$new_path"
+            save_app_settings
+            print_success "Repository path updated to $(shorten_path "$REPO_DIR")"
+        fi
+    fi
+    pause_for_return
+}
+
+open_in_file_manager() {
+    local path="$1"
+    if command -v xdg-open >/dev/null 2>&1; then
+        (xdg-open "$path" >/dev/null 2>&1 &) || true
+        print_success "Opened $(shorten_path "$path") in your file manager."
+    else
+        print_warning "xdg-open not found. Path: $(shorten_path "$path")"
+    fi
+}
+
+settings_open_repository() {
+    begin_action_screen "Settings › Open repository"
+    open_in_file_manager "$REPO_DIR"
+    pause_for_return
+}
+
+settings_open_config_dir() {
+    begin_action_screen "Settings › Open config directory"
+    open_in_file_manager "$APP_CONFIG_DIR"
+    pause_for_return
+}
+
+settings_theme_menu() {
+    while true; do
+        show_interactive_menu "Settings › Theme" 0 "Default" "Catppuccin Mocha" "Back"
+
+        case "$MENU_RESULT" in
+            0)
+                THEME_NAME="default"
+                apply_theme "$THEME_NAME"
+                save_app_settings
+                begin_action_screen "Settings › Theme"
+                print_success "Theme set to Default."
+                pause_for_return
+                ;;
+            1)
+                THEME_NAME="mocha"
+                apply_theme "$THEME_NAME"
+                save_app_settings
+                begin_action_screen "Settings › Theme"
+                print_success "Theme set to Catppuccin Mocha."
+                pause_for_return
+                ;;
+            2 | BACK) return ;;
+        esac
+    done
+}
+
+show_about_screen() {
+    begin_action_screen "About"
+    echo "  ${C_BOLD}dotfiles${C_RESET} ${C_DIM}v${APP_VERSION}${C_RESET}"
+    echo
+    echo "  Keeps the config files in \$HOME in sync with a git repository,"
+    echo "  so you don't have to remember which dozen directories you"
+    echo "  actually care about. That's what Tracked Files is for."
+    echo
+    echo "  Repository: $(shorten_path "$REPO_DIR")"
+    echo "  Config:     $(shorten_path "$APP_CONFIG_DIR")"
+    echo
+    echo "  ${C_DIM}Built with Bash, ANSI escape codes, and a healthy respect"
+    echo "  for how much can go wrong when rm -rf is one typo away.${C_RESET}"
+    pause_for_return
+}
+
+settings_menu() {
+    while true; do
+        show_interactive_menu "Settings" 0 \
+            "Repository path" \
+            "Open repository" \
+            "Open config directory" \
+            "Theme" \
+            "About" \
+            "Back"
+
+        case "$MENU_RESULT" in
+            0) settings_repository_path ;;
+            1) settings_open_repository ;;
+            2) settings_open_config_dir ;;
+            3) settings_theme_menu ;;
+            4) show_about_screen ;;
+            5 | BACK) return ;;
+        esac
+    done
+}
+
+# --- Main -----------------------------------------------------------------------
+
+main_menu() {
+    local -a items=(
+        "Sync dotfiles to repository"
+        "Restore dotfiles to system"
+        "Git"
+        "Tracked files"
+        "Settings"
+        "Exit"
+    )
+
+    while true; do
+        show_interactive_menu "DOTFILES MANAGER" 1 "${items[@]}"
+
+        case "$MENU_RESULT" in
+            0) action_sync ;;
+            1) action_restore ;;
+            2) git_menu ;;
+            3) tracked_files_menu ;;
+            4) settings_menu ;;
+            5) cleanup_and_exit 0 ;;
+            BACK) : ;; # nowhere further back to go from the main menu
+        esac
+    done
+}
+
+# ============================================================================
+# SECTION 12: MAIN LOOP
+# ============================================================================
+
+# Restore the terminal and exit. Every exit path in this app — the Exit
+# menu item, pressing q, an unhandled error, or Ctrl+C — routes through
+# here, so the person's shell is never left in a broken state.
+cleanup_and_exit() {
+    local code="${1:-0}"
+    restore_terminal_mode
+    clear
+    echo "  ${C_DIM}Goodbye — may your builds be fast and your merges conflict-free.${C_RESET}"
+    exit "$code"
+}
+
+# Beautiful errors. An uncaught failure anywhere in this script lands
+# here instead of dumping a raw Bash stack trace on someone — a C++
+# segfault at least gives you a core dump; the least Bash can do is give
+# you a sentence.
+on_error() {
+    local exit_code=$? line_no="${1:-unknown}"
+    restore_terminal_mode
+    echo
+    print_error "Something went wrong (exit code ${exit_code}) near line ${line_no}."
+    print_info "This shouldn't happen — please report it if it keeps occurring."
+    exit "$exit_code"
+}
+
+main() {
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        echo "dotfiles: this is an interactive terminal application — please run it in a terminal." >&2
+        exit 1
+    fi
+
+    trap 'on_error $LINENO' ERR
+    trap 'cleanup_and_exit 130' INT
+    trap 'cleanup_and_exit 0' TERM
+    trap 'restore_terminal_mode' EXIT
+
+    load_app_settings
+    load_tracked_paths
+    apply_theme "$THEME_NAME"
+    enter_raw_mode
+
+    main_menu
+}
+
+# Only run main if this script is executed directly, not sourced. This
+# makes it possible to source the file (e.g. from a test harness) and
+# call individual functions without kicking off the interactive app.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi
