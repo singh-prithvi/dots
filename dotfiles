@@ -31,7 +31,7 @@
 # also texting your mom before a road trip. A little paranoid. Correct.
 set -Eeuo pipefail
 
-readonly APP_VERSION="2.0.0"
+readonly APP_VERSION="1.0.0"
 
 # Where this tool keeps its OWN configuration: which paths are tracked,
 # and small settings like the repository location and color theme.
@@ -76,6 +76,96 @@ readonly ICON_DIR="📁"
 readonly ICON_FILE="📄"
 readonly ICON_SYNC="🔄"
 readonly ICON_ROCKET="🚀"
+
+readonly -a EXIT_MESSAGES=(
+        "Go study DSA. Your configs are optimized enough."
+        "Your Neovim config still isn't finished. Nice try."
+        "Git remembers everything. Unlike you after an all-nighter."
+        "Congratulations. You successfully edited configuration files instead of using your computer."
+        "Arch behaved today. Buy a lottery ticket."
+        "You don't need another terminal emulator."
+        "One more Hyprland animation was NOT the answer."
+        "Future-you appreciates the commit. Probably."
+        "Remember: backups exist because confidence is temporary."
+        "Go touch some grass. It's open source too."
+        "You escaped this program easier than you escape Vim."
+        "Your dotfiles have been emotionally supported."
+        "Another successful session of productive procrastination."
+        "Today's winner: configuration over actual work."
+        "The real bug was between the keyboard and the chair."
+        "One less merge conflict. One more existential conflict."
+        "The compiler is waiting."
+        "May your segfaults be reproducible."
+        "Don't forget to push before reinstalling Arch again."
+        "See you after the next 'tiny' config change."
+
+        # Git
+        "Your last commit message deserved a code review."
+        "Git has more confidence in your history than you do."
+        "Congratulations. You committed before reading the diff again."
+        "Every git add -A is a trust fall."
+        "One day you'll use interactive rebase. Today is not that day."
+        "Git stash: where good intentions go to die."
+        "If Git had feelings, it'd be requesting a transfer."
+        "You changed 3 files. Git says 127."
+        "Your repository is cleaner than your desktop."
+        "Git is distributed. Your attention span is not."
+        "Another commit. Still no README."
+        "Your branch name is more organized than your life."
+        "The merge conflict was trying to warn you."
+        "Force push? I dare you."
+        "Git blame already knows."
+
+        # Linux / Arch
+        "You've spent more time updating than using your computer."
+        "Congratulations. You survived another pacman -Syu."
+        "Arch is stable. You're the unstable variable."
+        "You fix Linux so often it should pay rent."
+        "The wiki can't solve this one. Nice try."
+        "One more kernel update won't fix procrastination."
+        "You installed another package. You still won't use it."
+        "Your package count is a personality trait now."
+        "You optimize boot time like you're late every morning."
+
+        # Hyprland
+        "Your window animations have better timing than your study schedule."
+        "You moved the bar 3 pixels. Productivity increased by 0%."
+        "Hyprland is beautiful. Your workflow is still chaos."
+        "Another keybind. Same old habits."
+        "You customize everything except your sleep schedule."
+
+        # Neovim
+        "You wrote another Lua plugin instead of writing code."
+        "Neovim launches faster than you start assignments."
+        "You have more plugins than projects."
+        "You optimized startup by 8ms. Incredible. Anyway..."
+        "Your init.lua has become its own operating system."
+        "You opened Neovim to edit one line. Two hours later..."
+
+        # C++
+        "Undefined behavior understands you better than your debugger."
+        "Your compiler has trust issues."
+        "Template errors are still longer than your attention span."
+        "std::cout is carrying your entire semester."
+        "Segmentation fault. Character development complete."
+
+        # You specifically
+        "You spent 4 hours automating a 20-second task."
+        "You don't need another config file. You need lunch."
+        "That wasn't a bug. It was a feature until Git exposed it."
+        "Remember when this was supposed to be a 'quick tweak'?"
+        "You've reorganized your dotfiles more than your study notes."
+        "Your desktop is production-ready. Your assignments aren't."
+        "Another optimization. Same deadlines."
+        "You benchmark SSDs for fun but still forget where you saved the file."
+        "You've mastered Linux. Now master finishing projects."
+        "You're one plugin away from enlightenment. Probably."
+        "Your TODO list has TODOs."
+        "You've reached peak overengineering. Congratulations."
+        "The only thing more customized than your desktop is your procrastination."
+        "You came here to sync dotfiles. Somehow you lost two hours."
+        "Go make something. Your configs are already prettier than most people's."
+)
 
 # ============================================================================
 # SECTION 2: THEME
@@ -202,6 +292,10 @@ print_summary() {
                 echo "  Errors: ${C_GREEN}${errors}${C_RESET}"
         fi
         print_rule "─"
+}
+
+random_exit_message() {
+        printf '%s\n' "${EXIT_MESSAGES[RANDOM % ${#EXIT_MESSAGES[@]}]}"
 }
 
 # ============================================================================
@@ -831,9 +925,7 @@ git_commit() {
 
         local message
         restore_terminal_mode
-
         message=$(prompt_line "Commit message: ")
-
         enter_raw_mode
 
         if [[ -z "$message" ]]; then
@@ -1086,7 +1178,9 @@ settings_repository_path() {
 
         if confirm "Change the repository path?"; then
                 local new_path
+                restore_terminal_mode
                 new_path=$(prompt_line "New path (e.g. ~/dots): ")
+                enter_raw_mode
                 new_path="${new_path/#\~/$HOME}" # bash won't expand a literal ~ for us here
 
                 if [[ -z "$new_path" ]]; then
@@ -1223,7 +1317,9 @@ cleanup_and_exit() {
         local code="${1:-0}"
         restore_terminal_mode
         clear
-        echo "  ${C_DIM}Goodbye — may your builds be fast and your merges conflict-free.${C_RESET}"
+        echo
+        echo "  ${C_DIM}$(random_exit_message)${C_RESET}"
+        echo
         exit "$code"
 }
 
