@@ -50,6 +50,14 @@ hl.bind(
 --#############################################################################
 --## HARDWARE / SWITCH HANDLERS
 --#############################################################################
+local function notifyCannotDisconnect()
+	hl.dispatch(
+		hl.dsp.exec_cmd(
+			[[notify-send -u low -t 3000 -a "Hyprland" "󰌾 Laptop Mode" "Can't disconnect the only active display"]]
+		)
+	)
+end
+
 local function disableLaptopDisplay()
 	hl.monitor({
 		output = "eDP-1",
@@ -77,7 +85,25 @@ local function enableLaptopDisplay()
 	)
 end
 
+local function toggleLaptopDisplay()
+	if hl.get_monitor("eDP-1") then
+		if #hl.get_monitors() == 1 then
+			notifyCannotDisconnect()
+			return
+		end
+
+		disableLaptopDisplay()
+	else
+		enableLaptopDisplay()
+	end
+end
+
 hl.bind("switch:on:Lid Switch", function()
+	if #hl.get_monitors() == 1 then
+		notifyCannotDisconnect()
+		return
+	end
+
 	disableLaptopDisplay()
 end, { locked = true })
 
@@ -86,12 +112,11 @@ hl.bind("switch:off:Lid Switch", function()
 end, { locked = true })
 
 hl.bind("SUPER + SHIFT + ALT + F1", function()
-	if hl.get_monitor("eDP-1") then
-		disableLaptopDisplay()
-	else
-		enableLaptopDisplay()
-	end
-end, { locked = true, description = "Screen: Toggle laptop display" })
+	toggleLaptopDisplay()
+end, {
+	locked = true,
+	description = "Screen: Toggle laptop display",
+})
 
 --#############################################################################
 --## BRIGHTNESS / VOLUME (hardware keys)
