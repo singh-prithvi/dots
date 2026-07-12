@@ -6,11 +6,11 @@ return {
             -- 🔀 SWITCH: choose manual vs automatic battery-based style selection
             --   true  -> automatically detect AC/battery and pick style 5 or 13
             --   false -> always use `manual_style` below, ignoring power state
-            local use_battery_detection = false
+            local use_battery_detection = true
 
             -- 🔁 Used only when use_battery_detection = false.
             -- CHANGE THIS NUMBER (1–13) to switch cursor style manually.
-            local manual_style = 5
+            local manual_style = 13
 
             -- 🔋 Detect AC vs battery power by scanning /sys/class/power_supply
             -- for the supply whose `type` is "Mains", rather than assuming

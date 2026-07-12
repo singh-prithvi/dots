@@ -50,18 +50,48 @@ hl.bind(
 --#############################################################################
 --## HARDWARE / SWITCH HANDLERS
 --#############################################################################
+local function disableLaptopDisplay()
+	hl.monitor({
+		output = "eDP-1",
+		disabled = true,
+	})
+
+	hl.dispatch(
+		hl.dsp.exec_cmd(
+			[[notify-send -u low -t 3000 -a "Hyprland" "󰌾 Clamshell Mode" "Laptop display disconnected"]]
+		)
+	)
+end
+
+local function enableLaptopDisplay()
+	hl.monitor({
+		output = "eDP-1",
+		disabled = false,
+		mode = "1920x1200@60",
+		position = "0x240",
+		scale = 1,
+	})
+
+	hl.dispatch(
+		hl.dsp.exec_cmd([[notify-send -u low -t 3000 -a "Hyprland" "󰌾 Laptop Mode" "Laptop display connected"]])
+	)
+end
+
 hl.bind("switch:on:Lid Switch", function()
-	hl.dispatch(hl.dsp.dpms({ action = "off", monitor = "eDP-1" }))
-	hl.dispatch(
-		hl.dsp.exec_cmd([[notify-send -u low -t 3000 -a "Hyprland" "󰌾 Clamshell Mode" "Laptop display turned off"]])
-	)
+	disableLaptopDisplay()
 end, { locked = true })
+
 hl.bind("switch:off:Lid Switch", function()
-	hl.dispatch(hl.dsp.dpms({ action = "on", monitor = "eDP-1" }))
-	hl.dispatch(
-		hl.dsp.exec_cmd([[notify-send -u low -t 3000 -a "Hyprland" "󰌾 Laptop Mode" "Laptop display turned on"]])
-	)
+	enableLaptopDisplay()
 end, { locked = true })
+
+hl.bind("SUPER + SHIFT + ALT + F1", function()
+	if hl.get_monitor("eDP-1") then
+		disableLaptopDisplay()
+	else
+		enableLaptopDisplay()
+	end
+end, { locked = true, description = "Screen: Toggle laptop display" })
 
 --#############################################################################
 --## BRIGHTNESS / VOLUME (hardware keys)
