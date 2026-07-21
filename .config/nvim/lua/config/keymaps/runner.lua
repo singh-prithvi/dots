@@ -1,5 +1,5 @@
 -- lua/config/keymaps/runner.lua
--- F5 multi-language runner: C++, Python, Rust.
+-- F5 multi-language runner: C++, Python, Rust, Java.
 -- Shares all C++ build-resolution logic with debugging.lua via config.utils.
 local utils = require("config.utils")
 
@@ -59,6 +59,31 @@ local function cpp_command(abs_file)
         .. vim.fn.shellescape(out)
 end
 
+-- ─── Java build-command builder ───────────────────────────────────────────
+-- Tier 1: Maven project. Tier 2: Gradle project. Tier 3: single file, using
+-- the Java 11+ source-code launcher (`java Foo.java`), which compiles and
+-- runs in one step — no explicit javac invocation needed.
+
+local function java_command(abs_file, dir)
+    -- Tier 1: Maven
+    local maven_root = utils.find_project_root(dir, "pom.xml")
+    if maven_root then
+        -- Requires exec-maven-plugin with a mainClass configured in the pom;
+        -- otherwise mvn will prompt for -Dexec.mainClass=...
+        return "cd " .. vim.fn.shellescape(maven_root) .. " && mvn -q compile exec:java"
+    end
+
+    -- Tier 2: Gradle
+    local gradle_root = utils.find_project_root(dir, "build.gradle") or utils.find_project_root(dir, "build.gradle.kts")
+    if gradle_root then
+        -- Requires the `application` plugin to provide the `run` task
+        return "cd " .. vim.fn.shellescape(gradle_root) .. " && ./gradlew -q run"
+    end
+
+    -- Tier 3: single file
+    return "java " .. vim.fn.shellescape(abs_file)
+end
+
 -- ─── Channel dispatcher ────────────────────────────────────────────────────
 
 local function run_file_in_chan(chan, abs_file, ft)
@@ -72,6 +97,8 @@ local function run_file_in_chan(chan, abs_file, ft)
         vim.fn.chansend(chan, cpp_command(abs_file) .. "\n")
     elseif ft == "python" then
         vim.fn.chansend(chan, "python3 " .. vim.fn.shellescape(abs_file) .. "\n")
+    elseif ft == "java" then
+        vim.fn.chansend(chan, java_command(abs_file, dir) .. "\n")
     elseif ft == "rust" then
         local cargo_root = utils.find_project_root(dir, "Cargo.toml")
         if cargo_root then
@@ -104,7 +131,7 @@ vim.keymap.set({ "n", "i", "t" }, "<F5>", function()
     end
 
     local ft = vim.bo.filetype
-    if ft ~= "cpp" and ft ~= "python" and ft ~= "rust" then
+    if ft ~= "cpp" and ft ~= "python" and ft ~= "rust" and ft ~= "java" then
         return
     end
 
@@ -147,4 +174,4 @@ vim.keymap.set({ "n", "i", "t" }, "<F5>", function()
     end
 
     vim.cmd("wincmd p") -- return focus to source file
-end, { desc = "Run current file (C++ / Python / Rust)" })
+end, { desc = "Run current file (C++ / Python / Rust / Java)" })

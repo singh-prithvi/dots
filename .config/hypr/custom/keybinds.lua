@@ -704,6 +704,15 @@ hl.bind(
 	{ description = "App: Terminal (secondary, convention exception — see spec §18)" }
 )
 hl.bind("SUPER + E", hl.dsp.exec_cmd(fileManager), { description = "App: File manager" })
+hl.bind(
+	"SUPER + SHIFT + E",
+	hl.dsp.exec_cmd("dolphin", {
+		float = true,
+		center = true,
+		size = { "(monitor_w*0.60)", "(monitor_h*0.60)" },
+	}),
+	{ description = "App: Floating Dolphin" }
+)
 hl.bind("SUPER + B", hl.dsp.exec_cmd(browser), { description = "App: Browser" })
 hl.bind("SUPER + C", hl.dsp.exec_cmd(codeEditor), { description = "App: Code editor" })
 hl.bind("CTRL + SUPER + SHIFT + ALT + W", hl.dsp.exec_cmd(officeSoftware), { description = "App: Office software" })
